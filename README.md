@@ -10,3 +10,9 @@ The target model is niri-style scrolling columns:
 - fullscreen and non-resizable windows are ignored
 
 This is a scaffold for iteration, not a finished replacement for Hyprland or niri.
+
+Open the preferences UI with:
+
+```bash
+gnome-extensions prefs ohno-scroller@ohnoibrokeit.dev
+```
