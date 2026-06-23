@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="dev.ohnoibrokeit.gnome-shell.extensions.ohno-scroller" path="/dev/ohnoibrokeit/gnome-shell/extensions/ohno-scroller/">
+    <key name="tiling-enabled" type="b">
+      <default>true</default>
+      <summary>Enable tiling</summary>
+      <description>Whether the extension should manage normal windows on the active workspace.</description>
+    </key>
+    <key name="gap-size" type="i">
+      <default>10</default>
+      <range min="0" max="64"/>
+      <summary>Gap size</summary>
+      <description>Pixels between tiled windows and columns.</description>
+    </key>
+    <key name="column-width-percent" type="i">
+      <default>50</default>
+      <range min="25" max="100"/>
+      <summary>Column width percent</summary>
+      <description>Default column width as a percentage of the monitor work area.</description>
+    </key>
+    <key name="toggle-tiling" type="as">
+      <default>['&lt;Super&gt;y']</default>
+      <summary>Toggle tiling</summary>
+    </key>
+    <key name="retile-workspace" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;y']</default>
+      <summary>Retile workspace</summary>
+    </key>
+    <key name="focus-column-left" type="as">
+      <default>['&lt;Super&gt;h']</default>
+      <summary>Focus column left</summary>
+    </key>
+    <key name="focus-column-right" type="as">
+      <default>['&lt;Super&gt;l']</default>
+      <summary>Focus column right</summary>
+    </key>
+    <key name="move-window-left" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;h']</default>
+      <summary>Move focused window left</summary>
+    </key>
+    <key name="move-window-right" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;l']</default>
+      <summary>Move focused window right</summary>
+    </key>
+    <key name="move-window-new-column" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;Return']</default>
+      <summary>Move focused window to a new column</summary>
+    </key>
+  </schema>
+</schemalist>

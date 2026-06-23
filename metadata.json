@@ -1,0 +1,9 @@
+{
+  "uuid": "ohno-scroller@ohnoibrokeit.dev",
+  "name": "Oh No Scroller",
+  "description": "Experimental GNOME tiler with niri-style scrolling columns.",
+  "shell-version": ["50"],
+  "settings-schema": "dev.ohnoibrokeit.gnome-shell.extensions.ohno-scroller",
+  "url": "https://github.com/OhNoIBrokeIt/bluefin-gaming-dx",
+  "version": 1
+}
