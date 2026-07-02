@@ -8,10 +8,15 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 const KEYBINDINGS = [
     'toggle-tiling',
     'retile-workspace',
+    'equalize-ratios',
     'focus-column-left',
     'focus-column-right',
+    'focus-up',
+    'focus-down',
     'move-window-left',
     'move-window-right',
+    'move-window-up',
+    'move-window-down',
     'move-window-new-column',
 ];
 
@@ -138,10 +143,15 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         const handlers = {
             'toggle-tiling': () => this._toggleTiling(),
             'retile-workspace': () => this._retileActiveWorkspace(),
-            'focus-column-left': () => this._focusColumn(-1),
-            'focus-column-right': () => this._focusColumn(1),
-            'move-window-left': () => this._moveFocusedWindow(-1),
-            'move-window-right': () => this._moveFocusedWindow(1),
+            'equalize-ratios': () => this._equalizeRatios(),
+            'focus-column-left': () => this._focusNeighbor('x', -1),
+            'focus-column-right': () => this._focusNeighbor('x', 1),
+            'focus-up': () => this._focusNeighbor('y', -1),
+            'focus-down': () => this._focusNeighbor('y', 1),
+            'move-window-left': () => this._moveFocusedWindow('x', -1),
+            'move-window-right': () => this._moveFocusedWindow('x', 1),
+            'move-window-up': () => this._moveFocusedWindow('y', -1),
+            'move-window-down': () => this._moveFocusedWindow('y', 1),
             'move-window-new-column': () => this._moveFocusedWindowToNewColumn(),
         };
 
@@ -167,6 +177,31 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
     _toggleTiling() {
         this._settings.set_boolean('tiling-enabled', !this._settings.get_boolean('tiling-enabled'));
+    }
+
+    // Reset every split on the active workspace back to 50/50 — the undo
+    // for accumulated resize-to-ratio adjustments.
+    _equalizeRatios() {
+        if (!this._tilingEnabled())
+            return;
+
+        const perMonitor = this._states.get(this._activeWorkspace());
+        if (!perMonitor)
+            return;
+
+        for (const state of perMonitor.values())
+            this._resetRatios(state.root);
+
+        this._retileActiveWorkspace();
+    }
+
+    _resetRatios(node) {
+        if (!node || node.type === 'leaf')
+            return;
+
+        node.ratio = 0.5;
+        this._resetRatios(node.first);
+        this._resetRatios(node.second);
     }
 
     _queueRetile(delayMs = 0) {
@@ -528,9 +563,10 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     }
 
     // Pick the tile nearest to `window` whose center lies in `direction`
-    // (-1 left, +1 right). Horizontal distance dominates; vertical distance
-    // breaks ties so stacked tiles resolve to the row the window sits in.
-    _spatialNeighbor(state, workspace, monitor, window, direction) {
+    // (-1 left/up, +1 right/down) along `axis`. Distance along the axis
+    // dominates; the cross-axis distance breaks ties so stacked tiles
+    // resolve to the row/column the window actually sits in.
+    _spatialNeighbor(state, workspace, monitor, window, axis, direction) {
         const workArea = workspace.get_work_area_for_monitor(monitor);
         const gap = this._settings.get_int('gap-size');
         const rects = this._layoutRects(state.root, this._insetRect(workArea, gap), gap);
@@ -548,12 +584,17 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 continue;
 
             const center = this._rectCenter(rect);
-            const dx = center.x - currentCenter.x;
+            const primary = axis === 'x'
+                ? center.x - currentCenter.x
+                : center.y - currentCenter.y;
+            const secondary = axis === 'x'
+                ? Math.abs(center.y - currentCenter.y)
+                : Math.abs(center.x - currentCenter.x);
 
-            if (direction < 0 ? dx >= 0 : dx <= 0)
+            if (direction < 0 ? primary >= 0 : primary <= 0)
                 continue;
 
-            const distance = Math.abs(dx) * 4 + Math.abs(center.y - currentCenter.y);
+            const distance = Math.abs(primary) * 4 + secondary;
 
             if (distance < bestDistance) {
                 bestDistance = distance;
@@ -568,7 +609,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
     }
 
-    _focusColumn(direction) {
+    _focusNeighbor(axis, direction) {
         if (!this._tilingEnabled())
             return;
 
@@ -579,7 +620,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         const workspace = window.get_workspace();
         const monitor = window.get_monitor();
         const state = this._stateFor(workspace, monitor);
-        const neighbor = this._spatialNeighbor(state, workspace, monitor, window, direction);
+        const neighbor = this._spatialNeighbor(state, workspace, monitor, window, axis, direction);
 
         if (neighbor) {
             state.activeWindow = neighbor;
@@ -587,7 +628,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         }
     }
 
-    _moveFocusedWindow(direction) {
+    _moveFocusedWindow(axis, direction) {
         if (!this._tilingEnabled())
             return;
 
@@ -598,7 +639,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         const workspace = window.get_workspace();
         const monitor = window.get_monitor();
         const state = this._stateFor(workspace, monitor);
-        const neighbor = this._spatialNeighbor(state, workspace, monitor, window, direction);
+        const neighbor = this._spatialNeighbor(state, workspace, monitor, window, axis, direction);
 
         if (!neighbor)
             return;

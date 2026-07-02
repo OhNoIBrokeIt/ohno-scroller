@@ -9,7 +9,8 @@ The current target model is Hyprland-dwindle-style bounded splits:
 - dragging a window edge folds the resize into the split ratio, so the
   layout keeps the size you chose (a plain move snaps back)
 - focus and move shortcuts act on the spatially nearest tile in that
-  direction
+  direction, in all four directions (Super+H/J/K/L by default)
+- Super+= resets every split on the workspace back to 50/50
 - every tiled window is clamped inside the monitor work area
 - fullscreen and non-resizable windows are ignored
 

@@ -51,10 +51,15 @@ export default class OhNoScrollerPrefs extends ExtensionPreferences {
         for (const [title, key] of [
             ['Toggle tiling', 'toggle-tiling'],
             ['Retile workspace', 'retile-workspace'],
+            ['Equalize split ratios', 'equalize-ratios'],
             ['Focus column left', 'focus-column-left'],
             ['Focus column right', 'focus-column-right'],
+            ['Focus tile above', 'focus-up'],
+            ['Focus tile below', 'focus-down'],
             ['Move window left', 'move-window-left'],
             ['Move window right', 'move-window-right'],
+            ['Move window up', 'move-window-up'],
+            ['Move window down', 'move-window-down'],
             ['Move window to new column', 'move-window-new-column'],
         ]) {
             const row = new Adw.ActionRow({

@@ -51,5 +51,25 @@
       <default>['&lt;Super&gt;&lt;Shift&gt;Return']</default>
       <summary>Move focused window to a new column</summary>
     </key>
+    <key name="focus-up" type="as">
+      <default>['&lt;Super&gt;k']</default>
+      <summary>Focus tile above</summary>
+    </key>
+    <key name="focus-down" type="as">
+      <default>['&lt;Super&gt;j']</default>
+      <summary>Focus tile below</summary>
+    </key>
+    <key name="move-window-up" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;k']</default>
+      <summary>Move focused window up</summary>
+    </key>
+    <key name="move-window-down" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;j']</default>
+      <summary>Move focused window down</summary>
+    </key>
+    <key name="equalize-ratios" type="as">
+      <default>['&lt;Super&gt;equal']</default>
+      <summary>Reset all split ratios on the active workspace to 50/50</summary>
+    </key>
   </schema>
 </schemalist>
