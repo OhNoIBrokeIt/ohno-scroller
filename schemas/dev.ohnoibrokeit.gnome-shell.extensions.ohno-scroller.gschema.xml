@@ -13,10 +13,15 @@
       <description>Pixels between tiled windows and columns.</description>
     </key>
     <key name="column-width-percent" type="i">
-      <default>50</default>
+      <default>100</default>
       <range min="25" max="100"/>
-      <summary>Column width percent</summary>
-      <description>Default column width as a percentage of the monitor work area.</description>
+      <summary>Reserved column width percent</summary>
+      <description>Reserved for compatibility with older preferences; the current bounded split layout does not use it.</description>
+    </key>
+    <key name="debug-logging" type="b">
+      <default>false</default>
+      <summary>Enable debug logging</summary>
+      <description>Log retile activity, suppressed retiles, skipped placements, and crowded tiles to the journal for troubleshooting.</description>
     </key>
     <key name="toggle-tiling" type="as">
       <default>['&lt;Super&gt;y']</default>

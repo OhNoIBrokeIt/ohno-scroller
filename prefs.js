@@ -11,33 +11,18 @@ function addSwitch(group, settings, key, title, subtitle = null) {
 }
 
 function addSpin(group, settings, key, title, lower, upper, step, subtitle = null) {
-    const adjustment = new Gtk.Adjustment({
-        lower,
-        upper,
-        step_increment: step,
-        page_increment: step * 5,
-    });
-    const spin = new Gtk.SpinButton({
-        adjustment,
-        numeric: true,
-        valign: Gtk.Align.CENTER,
-    });
-    const row = new Adw.ActionRow({
+    const row = new Adw.SpinRow({
         title,
         subtitle,
-        activatable_widget: spin,
+        adjustment: new Gtk.Adjustment({
+            lower,
+            upper,
+            step_increment: step,
+            page_increment: step * 5,
+        }),
     });
 
-    spin.set_value(settings.get_int(key));
-    spin.connect('value-changed', () => {
-        settings.set_int(key, spin.get_value_as_int());
-    });
-    settings.connect(`changed::${key}`, () => {
-        if (spin.get_value_as_int() !== settings.get_int(key))
-            spin.set_value(settings.get_int(key));
-    });
-
-    row.add_suffix(spin);
+    settings.bind(key, row, 'value', Gio.SettingsBindFlags.DEFAULT);
     group.add(row);
 }
 
@@ -56,7 +41,6 @@ export default class OhNoScrollerPrefs extends ExtensionPreferences {
 
         addSwitch(layoutGroup, settings, 'tiling-enabled', 'Manage windows');
         addSpin(layoutGroup, settings, 'gap-size', 'Gap size', 0, 64, 1, 'Pixels between windows and columns.');
-        addSpin(layoutGroup, settings, 'column-width-percent', 'Column width', 25, 100, 5, 'Percent of monitor width used by each column.');
 
         const shortcutsGroup = new Adw.PreferencesGroup({
             title: 'Shortcuts',

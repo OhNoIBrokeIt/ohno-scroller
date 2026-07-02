@@ -2,14 +2,18 @@
 
 Experimental GNOME Shell tiler for a terminal-heavy workflow.
 
-The target model is niri-style scrolling columns:
+The current target model is Hyprland-dwindle-style bounded splits:
 
-- each workspace and monitor owns an independent set of columns
-- each column stacks one or more windows vertically
-- the active column is kept visible by scrolling the logical workspace
+- each workspace and monitor owns an independent split tree
+- each new window splits the active tile along the tile's longest axis
+- dragging a window edge folds the resize into the split ratio, so the
+  layout keeps the size you chose (a plain move snaps back)
+- focus and move shortcuts act on the spatially nearest tile in that
+  direction
+- every tiled window is clamped inside the monitor work area
 - fullscreen and non-resizable windows are ignored
 
-This is a scaffold for iteration, not a finished replacement for Hyprland or niri.
+This is a scaffold for iteration, not a finished replacement for Hyprland or niri. The earlier niri-style scrolling layout was removed because off-screen window placement was too crash-prone under Mutter.
 
 Open the preferences UI with:
 
