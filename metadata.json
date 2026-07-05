@@ -5,5 +5,5 @@
   "shell-version": ["50"],
   "settings-schema": "dev.ohnoibrokeit.gnome-shell.extensions.ohno-scroller",
   "url": "https://github.com/OhNoIBrokeIt/bluefin-gaming-dx",
-  "version": 4
+  "version": 5
 }

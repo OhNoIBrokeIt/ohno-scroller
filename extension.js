@@ -34,6 +34,15 @@ const RATIO_MAX = 0.9;
 // An edge must move at least this many pixels before it counts as resized;
 // smaller drifts are apps settling (e.g. terminals snapping to cells).
 const RESIZE_EDGE_THRESHOLD = 2;
+// App-driven drift beyond these tolerances is snapped back by a retile.
+// Size gets slack for client-side snapping (terminal cell grids); position
+// has no such excuse and only tolerates rounding.
+const DRIFT_POSITION_TOLERANCE = 2;
+const DRIFT_SIZE_TOLERANCE = 32;
+// How many times a window is snapped back onto the same tile rect before we
+// stop fighting it. Any layout change (new target rect) or a manual
+// retile-workspace resets the count.
+const DRIFT_CORRECTION_LIMIT = 3;
 // Which window edges each pointer resize op drags. Moves and keyboard resizes
 // are absent on purpose: they get no ratio fold and simply snap back on the
 // retile that follows the grab.
@@ -58,6 +67,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._closingWindowSourceIds = new Map();
         this._states = new Map();
         this._appliedRects = new Map();
+        this._correctionHistory = new Map();
+        this._grabbedWindow = null;
         this._inLayout = false;
         this._retileSourceId = 0;
         this._retileLaterId = 0;
@@ -93,6 +104,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._closingWindowSourceIds.clear();
         this._states.clear();
         this._appliedRects.clear();
+        this._correctionHistory.clear();
+        this._grabbedWindow = null;
         this._inLayout = false;
         this._settings = null;
     }
@@ -124,12 +137,18 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._connect(Main.layoutManager, 'monitors-changed', () => {
             this._states.clear();
             this._appliedRects.clear();
+            this._correctionHistory.clear();
             this._queueRetile();
         });
         // User moves/resizes happen under a grab. A resize is folded back
         // into the split ratios so the layout keeps the user's chosen size;
-        // a plain move retiles the window back into its slot.
+        // a plain move retiles the window back into its slot. The grabbed
+        // window is tracked so drift correction never fights a live drag.
+        this._connect(global.display, 'grab-op-begin', (_display, window, _op) => {
+            this._grabbedWindow = window;
+        });
         this._connect(global.display, 'grab-op-end', (_display, window, op) => {
+            this._grabbedWindow = null;
             this._applyGrabbedGeometry(window, op);
             this._queueRetile();
         });
@@ -142,7 +161,13 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     _addKeybindings() {
         const handlers = {
             'toggle-tiling': () => this._toggleTiling(),
-            'retile-workspace': () => this._retileActiveWorkspace(),
+            'retile-workspace': () => {
+                // An explicit retile is the user overruling any window that
+                // was left alone after fighting its tile; give those windows
+                // a fresh correction budget.
+                this._correctionHistory.clear();
+                this._retileActiveWorkspace();
+            },
             'equalize-ratios': () => this._equalizeRatios(),
             'focus-column-left': () => this._focusNeighbor('x', -1),
             'focus-column-right': () => this._focusNeighbor('x', 1),
@@ -205,6 +230,12 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     }
 
     _queueRetile(delayMs = 0) {
+        // A delayed request (close settling) must not displace an immediate
+        // pass already scheduled for the next repaint — a burst of menu
+        // closes could otherwise postpone a real placement.
+        if (delayMs > 0 && this._retileLaterId)
+            return;
+
         this._cancelQueuedRetile();
 
         if (delayMs > 0) {
@@ -287,8 +318,15 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         const monitor = window.get_monitor();
         const state = this._stateFor(workspace, monitor);
 
-        if (this._containsWindow(state.root, window))
+        if (this._containsWindow(state.root, window)) {
             state.activeWindow = window;
+        } else if (this._tilingEnabled() && workspace === this._activeWorkspace()) {
+            // Some windows only become tileable after their initial retile
+            // (allows_resize flips late, skip-taskbar drops, transient hint
+            // clears). Focus is the reliable moment to admit the stragglers.
+            this._log(`focused window '${window.get_title() ?? '?'}' missing from layout; re-admitting`);
+            this._queueRetile();
+        }
     }
 
     _tileableWindows(workspace, monitor) {
@@ -335,11 +373,14 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (!window || this._windowSignals.has(window))
             return;
 
-        // Only state toggles that change whether the window participates in
-        // tiling are tracked. Geometry signals are deliberately not: user
-        // moves/resizes always happen under a grab (handled at grab-op-end),
-        // and app-driven geometry changes should not fight the layout. The
-        // _inLayout guard skips echoes from our own unmaximize during layout.
+        // State toggles that change whether the window participates in tiling
+        // are tracked, and so is its geometry: apps that restore their own
+        // size/position after being placed used to stay wherever they put
+        // themselves, overlapping their neighbors. Our own placements echo
+        // back inside the applied-rect tolerance (or during _inLayout), so
+        // only real app-driven drift reaches the corrective retile — and
+        // _onWindowGeometryChanged caps corrections per target rect so a
+        // window that refuses its tile cannot ping-pong forever.
         const queueUnlessLayout = () => {
             if (!this._inLayout)
                 this._queueRetile();
@@ -351,13 +392,22 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             window.connect('notify::fullscreen', queueUnlessLayout),
             window.connect('notify::maximized-horizontally', queueUnlessLayout),
             window.connect('notify::maximized-vertically', queueUnlessLayout),
+            window.connect('size-changed', () => this._onWindowGeometryChanged(window)),
+            window.connect('position-changed', () => this._onWindowGeometryChanged(window)),
             window.connect('unmanaged', () => {
                 this._clearPendingWindowRetile(window);
                 this._disconnectWindowSignals(window);
-                this._markWindowClosing(window);
-                this._removeWindowFromStates(window);
-                this._appliedRects.delete(window);
-                this._queueRetile(250);
+                this._correctionHistory.delete(window);
+                const wasPlaced = this._appliedRects.delete(window);
+                const wasInLayout = this._removeWindowFromStates(window);
+
+                // Menus, tooltips and other never-tiled windows come and go
+                // constantly; only a window that actually held a tile
+                // warrants the closing dance and a follow-up retile.
+                if (wasPlaced || wasInLayout) {
+                    this._markWindowClosing(window);
+                    this._queueRetile(250);
+                }
             }),
         ];
 
@@ -401,6 +451,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     }
 
     _removeWindowFromStates(window) {
+        let removed = false;
+
         for (const perMonitor of this._states.values()) {
             for (const state of perMonitor.values()) {
                 const previous = this._leafWindows(state.root);
@@ -410,12 +462,77 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 if (remaining.length === previous.length)
                     continue;
 
+                removed = true;
                 state.root = this._pruneTree(state.root, new Set(remaining));
 
                 if (state.activeWindow === window)
                     state.activeWindow = this._lastWindow(state.root);
             }
         }
+
+        return removed;
+    }
+
+    // App-driven geometry changes (session restore, late self-resize) used to
+    // stick, leaving the window on top of its neighbors. Snap the layout back
+    // when a placed window drifts off its applied rect, with a per-target cap
+    // so a window that refuses its tile cannot loop.
+    _onWindowGeometryChanged(window) {
+        if (this._inLayout || !this._settings || !this._tilingEnabled())
+            return;
+
+        if (this._grabbedWindow === window)
+            return;
+
+        const applied = this._appliedRects.get(window);
+        if (!applied || !this._isTileable(window))
+            return;
+
+        if (window.get_workspace() !== this._activeWorkspace())
+            return;
+
+        // A pass is already scheduled and will re-place everything anyway;
+        // it must not eat into this window's correction budget.
+        if (this._retileLaterId || this._retileSourceId)
+            return;
+
+        let frame;
+        try {
+            frame = window.get_frame_rect();
+        } catch (_error) {
+            return;
+        }
+
+        if (!frame)
+            return;
+
+        const drifted =
+            Math.abs(frame.x - applied.x) > DRIFT_POSITION_TOLERANCE ||
+            Math.abs(frame.y - applied.y) > DRIFT_POSITION_TOLERANCE ||
+            Math.abs(frame.width - applied.width) > DRIFT_SIZE_TOLERANCE ||
+            Math.abs(frame.height - applied.height) > DRIFT_SIZE_TOLERANCE;
+
+        if (!drifted)
+            return;
+
+        const targetKey = `${applied.x},${applied.y},${applied.width},${applied.height}`;
+        let corrections = this._correctionHistory.get(window);
+        if (!corrections || corrections.targetKey !== targetKey) {
+            corrections = {targetKey, count: 0, warned: false};
+            this._correctionHistory.set(window, corrections);
+        }
+
+        if (corrections.count >= DRIFT_CORRECTION_LIMIT) {
+            if (!corrections.warned) {
+                corrections.warned = true;
+                console.warn(`[ohno-scroller] '${window.get_title() ?? '?'}' refuses its tile after ${DRIFT_CORRECTION_LIMIT} corrections; leaving it alone until the layout changes`);
+            }
+            return;
+        }
+
+        corrections.count++;
+        this._log(`geometry drift on '${window.get_title() ?? '?'}'; re-asserting layout (${corrections.count}/${DRIFT_CORRECTION_LIMIT})`);
+        this._queueRetile();
     }
 
     _queueRetileAfterWindowReady(window) {
@@ -431,32 +548,37 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             ? window.get_compositor_private()
             : null;
 
-        if (!actor || typeof actor.connect !== 'function') {
-            const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
-                this._clearPendingWindowRetile(window, false);
-                this._queueRetile();
-                return GLib.SOURCE_REMOVE;
-            });
-
-            this._pendingRetileSignals.set(window, {actor: null, signalId: 0, timeoutId});
-            return;
-        }
-
-        let signalId = 0;
-        let timeoutId = 0;
-
-        signalId = actor.connect('first-frame', () => {
-            this._clearPendingWindowRetile(window);
-            this._queueRetile();
-        });
-
-        timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+        const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
             this._clearPendingWindowRetile(window, false);
             this._queueRetile();
             return GLib.SOURCE_REMOVE;
         });
 
-        this._pendingRetileSignals.set(window, {actor, signalId, timeoutId});
+        if (!actor || typeof actor.connect !== 'function') {
+            this._pendingRetileSignals.set(window, {actor: null, signalId: 0, destroyId: 0, timeoutId});
+            return;
+        }
+
+        const signalId = actor.connect('first-frame', () => {
+            this._clearPendingWindowRetile(window);
+            this._queueRetile();
+        });
+
+        // Short-lived windows (menus, tooltips) can be destroyed before the
+        // fallback timeout fires. Retire the pending entry together with the
+        // actor so nothing touches the actor after it is disposed; the
+        // unmanaged handler decides whether a retile is warranted.
+        const destroyId = actor.connect('destroy', () => {
+            const pending = this._pendingRetileSignals.get(window);
+            if (!pending)
+                return;
+
+            this._pendingRetileSignals.delete(window);
+            if (pending.timeoutId)
+                GLib.source_remove(pending.timeoutId);
+        });
+
+        this._pendingRetileSignals.set(window, {actor, signalId, destroyId, timeoutId});
     }
 
     _clearPendingWindowRetile(window, removeTimeout = true) {
@@ -466,9 +588,12 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
         this._pendingRetileSignals.delete(window);
 
-        if (pending.actor && pending.signalId) {
+        if (pending.actor) {
             try {
-                pending.actor.disconnect(pending.signalId);
+                if (pending.signalId)
+                    pending.actor.disconnect(pending.signalId);
+                if (pending.destroyId)
+                    pending.actor.disconnect(pending.destroyId);
             } catch (_error) {
                 // The actor may already be gone while its window is unmanaging.
             }
