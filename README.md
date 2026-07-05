@@ -61,4 +61,9 @@ bash tests/strip-harness.sh
 ```
 
 Design notes for the scrolling mode live in
-`docs/scroller-scrolling-mode-design.md` at the repo root.
+`docs/scrolling-mode-design.md`.
+
+This repo is the canonical source. The `bluefin-gaming-dx` image repo
+carries a vendored copy of the runtime files (synced by its
+`extensions/sync-ohno-scroller.sh`) that gets baked into the image —
+edit here, then re-sync there.

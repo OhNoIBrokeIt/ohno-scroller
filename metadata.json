@@ -5,6 +5,6 @@
   "shell-version": ["50"],
   "session-modes": ["user", "unlock-dialog"],
   "settings-schema": "dev.ohnoibrokeit.gnome-shell.extensions.ohno-scroller",
-  "url": "https://github.com/OhNoIBrokeIt/bluefin-gaming-dx",
+  "url": "https://github.com/OhNoIBrokeIt/ohno-scroller",
   "version": 6
 }
