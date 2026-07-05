@@ -146,6 +146,16 @@ ev "$TRANSLATIONS"
 echo "== frames after animated scroll (CHARLIE centered expected):"
 ev "$FRAMES"
 
+echo "== maximize CHARLIE: column -> 1.0, sw saved, window un-maximized on the spot:"
+ev "(()=>{($FIND)(\"CHARLIE\").maximize();return 0;})()"
+sleep 1
+ev "$STRIP"
+ev "(()=>{const w=($FIND)(\"CHARLIE\");return JSON.stringify([w.maximized_horizontally,w.maximized_vertically]);})()"
+echo "== maximize CHARLIE again: width restored, sw cleared:"
+ev "(()=>{($FIND)(\"CHARLIE\").maximize();return 0;})()"
+sleep 1
+ev "$STRIP"
+
 echo "== toggle back to bsp:"
 ev "Main.extensionManager.lookup(\"$UUID\").stateObj._toggleLayoutMode()"
 sleep 1

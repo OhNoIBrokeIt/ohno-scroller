@@ -579,8 +579,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             window.connect('workspace-changed', queueUnlessLayout),
             window.connect('notify::minimized', queueUnlessLayout),
             window.connect('notify::fullscreen', queueUnlessLayout),
-            window.connect('notify::maximized-horizontally', queueUnlessLayout),
-            window.connect('notify::maximized-vertically', queueUnlessLayout),
+            window.connect('notify::maximized-horizontally', () => this._onWindowMaximizedChanged(window)),
+            window.connect('notify::maximized-vertically', () => this._onWindowMaximizedChanged(window)),
             window.connect('size-changed', () => this._onWindowGeometryChanged(window)),
             window.connect('position-changed', () => this._onWindowGeometryChanged(window)),
             window.connect('unmanaged', () => {
@@ -696,6 +696,51 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             strip.focusColumn = -1;
 
         state.activeWindow = this._stripFocusedWindow(strip);
+    }
+
+    // Maximize in scrolling mode folds into the column: the column takes the
+    // full work-area width and the window itself is un-maximized on the
+    // spot. Hitting maximize again restores the remembered width, so the
+    // maximize key toggles full-width for the column. Explicit width changes
+    // (preset cycle, edge drag) discard the remembered width. BSP keeps the
+    // old behavior (a maximized window floats above the tiles until
+    // unmaximized, because it stops being resizable).
+    _onWindowMaximizedChanged(window) {
+        if (this._inLayout || !this._settings)
+            return;
+
+        if (this._tilingEnabled() &&
+            (window.maximized_horizontally || window.maximized_vertically)) {
+            const workspace = window.get_workspace();
+
+            if (workspace && this._workspaceMode(workspace) === 'scrolling' &&
+                NORMAL_WINDOW_TYPES.has(window.get_window_type()) &&
+                !window.get_transient_for()) {
+                const located = this._locateInStrips(workspace, window);
+
+                if (located) {
+                    const column = located.state.strip.columns[located.at.column];
+
+                    if (column.savedWidthFraction !== null && column.widthFraction >= COLUMN_WIDTH_MAX) {
+                        column.widthFraction = column.savedWidthFraction;
+                        column.savedWidthFraction = null;
+                        this._log('maximize toggle: column width restored');
+                    } else if (column.widthFraction < COLUMN_WIDTH_MAX) {
+                        column.savedWidthFraction = column.widthFraction;
+                        column.widthFraction = COLUMN_WIDTH_MAX;
+                        this._log('maximize: column width -> 100%');
+                    }
+                }
+
+                // Un-maximize right away rather than during placement: a
+                // maximized window reports allows_resize() false, so leaving
+                // it maximized until the retile would drop it from the strip
+                // instead of folding it. Covers app self-maximization too.
+                window.unmaximize();
+            }
+        }
+
+        this._queueRetile();
     }
 
     // App-driven geometry changes (session restore, late self-resize) used to
@@ -956,8 +1001,9 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
                 // Tiled windows must not stay maximized or they cover the rest of
                 // the layout; drop maximization before applying the tile rect.
+                // (Mutter 50 dropped the flags argument: unmaximize() is total.)
                 if (window.maximized_horizontally || window.maximized_vertically)
-                    window.unmaximize(Meta.MaximizeFlags.BOTH);
+                    window.unmaximize();
 
                 this._appliedRects.set(window, {
                     x: safeRect.x,
