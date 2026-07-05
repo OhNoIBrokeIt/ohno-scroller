@@ -21,6 +21,7 @@ const KEYBINDINGS = [
     'move-window-new-column',
     'stack-window-left',
     'stack-window-right',
+    'cycle-column-width',
 ];
 
 const LAYOUT_MODES = new Set(['bsp', 'scrolling']);
@@ -51,6 +52,9 @@ const DRIFT_CORRECTION_LIMIT = 3;
 // Bounds for a scrolling column's width as a fraction of the work area.
 const COLUMN_WIDTH_MIN = 0.2;
 const COLUMN_WIDTH_MAX = 1.0;
+// Width presets the cycle keybinding steps a scrolling column through; from
+// a drag-adjusted width the cycle resumes at the next-larger preset.
+const COLUMN_WIDTH_PRESETS = [1 / 3, 0.5, 2 / 3, 1.0];
 // Mutter refuses to place a frame with less than this many pixels visible
 // (measured empirically on Mutter 50: user-op placement clamps to exactly
 // 75px on-screen; non-user-op placement forces the window fully on-screen).
@@ -225,6 +229,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             'move-window-new-column': () => this._moveFocusedWindowToNewColumn(),
             'stack-window-left': () => this._stackFocusedWindow(-1),
             'stack-window-right': () => this._stackFocusedWindow(1),
+            'cycle-column-width': () => this._cycleColumnWidth(),
         };
 
         for (const name of KEYBINDINGS) {
@@ -1386,9 +1391,37 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         return {
             windows,
             widthFraction,
+            savedWidthFraction: null,
             heightWeights: windows.map(() => 1),
             focusIndex: 0,
         };
+    }
+
+    // Cycle the focused column 33 -> 50 -> 66 -> 100 and around. Any explicit
+    // width choice discards a remembered pre-maximize width.
+    _cycleColumnWidth() {
+        if (!this._tilingEnabled())
+            return;
+
+        const window = global.display.focus_window;
+        if (!window || !this._canPlace(window))
+            return;
+
+        const workspace = window.get_workspace();
+        if (this._workspaceMode(workspace) !== 'scrolling')
+            return;
+
+        const located = this._locateInStrips(workspace, window);
+        if (!located)
+            return;
+
+        const column = located.state.strip.columns[located.at.column];
+        column.savedWidthFraction = null;
+        column.widthFraction =
+            COLUMN_WIDTH_PRESETS.find(preset => preset > column.widthFraction + 0.01) ??
+            COLUMN_WIDTH_PRESETS[0];
+        this._log(`column width preset -> ${column.widthFraction.toFixed(3)}`);
+        this._queueRetile();
     }
 
     _defaultColumnWidth() {
@@ -1819,14 +1852,6 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (!applied)
             return;
 
-        const workspace = window.get_workspace();
-        const monitor = window.get_monitor();
-        const state = this._stateFor(workspace, monitor);
-        const path = this._pathToLeaf(state.root, window);
-
-        if (!path)
-            return;
-
         let frame;
         try {
             frame = window.get_frame_rect();
@@ -1835,6 +1860,20 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         }
 
         if (!frame)
+            return;
+
+        const workspace = window.get_workspace();
+
+        if (this._workspaceMode(workspace) === 'scrolling') {
+            this._foldStripResize(window, workspace, edges, applied, frame);
+            return;
+        }
+
+        const monitor = window.get_monitor();
+        const state = this._stateFor(workspace, monitor);
+        const path = this._pathToLeaf(state.root, window);
+
+        if (!path)
             return;
 
         // Fold the resize back into the split ratios so the retile that
@@ -1855,6 +1894,50 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         for (const {active, axis, childKey, delta} of adjustments) {
             if (active && Math.abs(delta) > RESIZE_EDGE_THRESHOLD)
                 this._resizeDivider(workArea, gap, path, axis, childKey, delta);
+        }
+    }
+
+    // The strip analog of ratio folding: a horizontal edge drag becomes the
+    // column's width fraction; a vertical edge drag shifts height weight
+    // between the window and the stack neighbor across the dragged edge, so
+    // the retile that follows the grab keeps the user's chosen sizes.
+    _foldStripResize(window, workspace, edges, applied, frame) {
+        const located = this._locateInStrips(workspace, window);
+        if (!located)
+            return;
+
+        const {state, monitor, at} = located;
+        const column = state.strip.columns[at.column];
+        const gap = this._settings.get_int('gap-size');
+
+        if ((edges.left || edges.right) && Math.abs(frame.width - applied.width) > RESIZE_EDGE_THRESHOLD) {
+            const inner = this._insetRect(workspace.get_work_area_for_monitor(monitor), gap);
+
+            if (inner.width > 0) {
+                column.savedWidthFraction = null;
+                column.widthFraction = Math.min(COLUMN_WIDTH_MAX,
+                    Math.max(COLUMN_WIDTH_MIN, frame.width / inner.width));
+                this._log(`column width folded to ${column.widthFraction.toFixed(3)}`);
+            }
+        }
+
+        if ((edges.top || edges.bottom) && Math.abs(frame.height - applied.height) > RESIZE_EDGE_THRESHOLD) {
+            const neighborIndex = edges.bottom ? at.index + 1 : at.index - 1;
+            const neighborApplied = this._appliedRects.get(column.windows[neighborIndex]);
+
+            // Weight moves between the dragged-edge pair only, so the rest of
+            // the stack keeps its shape; both windows keep a minimum tile.
+            if (neighborApplied && applied.height > 0 && neighborApplied.height > 0) {
+                const pairPixels = applied.height + neighborApplied.height;
+                const mine = Math.min(pairPixels - MIN_TILE_SIZE,
+                    Math.max(MIN_TILE_SIZE, frame.height));
+                const weights = column.heightWeights;
+                const pairWeight = (weights[at.index] ?? 1) + (weights[neighborIndex] ?? 1);
+
+                weights[at.index] = pairWeight * (mine / pairPixels);
+                weights[neighborIndex] = pairWeight * (1 - mine / pairPixels);
+                this._log(`stack heights folded between ${at.index} and ${neighborIndex}`);
+            }
         }
     }
 

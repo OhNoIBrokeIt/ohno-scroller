@@ -71,6 +71,7 @@ export default class OhNoScrollerPrefs extends ExtensionPreferences {
             ['Toggle layout mode', 'toggle-layout-mode'],
             ['Retile workspace', 'retile-workspace'],
             ['Equalize split ratios / stack heights', 'equalize-ratios'],
+            ['Cycle column width preset', 'cycle-column-width'],
             ['Stack window into left column', 'stack-window-left'],
             ['Stack window into right column', 'stack-window-right'],
             ['Focus column left', 'focus-column-left'],

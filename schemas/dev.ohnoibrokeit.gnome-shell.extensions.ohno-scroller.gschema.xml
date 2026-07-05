@@ -92,5 +92,9 @@
       <default>['&lt;Super&gt;equal']</default>
       <summary>Reset all split ratios on the active workspace to 50/50</summary>
     </key>
+    <key name="cycle-column-width" type="as">
+      <default>['&lt;Super&gt;r']</default>
+      <summary>Cycle the focused column through width presets (scrolling mode)</summary>
+    </key>
   </schema>
 </schemalist>

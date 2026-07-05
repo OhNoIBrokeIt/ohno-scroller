@@ -76,7 +76,8 @@ echo "== overview visible / focus now:"
 ev "JSON.stringify([Main.overview.visible, global.display.focus_window?.get_title() ?? null])"
 
 FRAMES="JSON.stringify({focus: global.display.focus_window?.get_title() ?? null, overview: Main.overview.visible, frames: global.get_window_actors().filter(a=>a.meta_window.get_title()).map(a=>{const w=a.meta_window;const f=w.get_frame_rect();return {t:w.get_title(),x:f.x,y:f.y,w:f.width,h:f.height,vis:a.visible};})})"
-STRIP="(()=>{const e=Main.extensionManager.lookup(\"$UUID\").stateObj;const ws=global.workspace_manager.get_active_workspace();const st=e._stateFor(ws,0);return JSON.stringify({mode:e._workspaceMode(ws),strip:st.strip?st.strip.columns.map(c=>({ws:c.windows.map(w=>w.get_title()),wf:c.widthFraction,fi:c.focusIndex})):null,focusCol:st.strip?st.strip.focusColumn:null});})()"
+STRIP="(()=>{const e=Main.extensionManager.lookup(\"$UUID\").stateObj;const ws=global.workspace_manager.get_active_workspace();const st=e._stateFor(ws,0);return JSON.stringify({mode:e._workspaceMode(ws),strip:st.strip?st.strip.columns.map(c=>({ws:c.windows.map(w=>w.get_title()),wf:Number(c.widthFraction.toFixed(3)),sw:c.savedWidthFraction,hw:c.heightWeights.map(h=>Number(h.toFixed(3))),fi:c.focusIndex})):null,focusCol:st.strip?st.strip.focusColumn:null});})()"
+FIND="(t) => global.get_window_actors().map(a=>a.meta_window).find(w=>w.get_title()===t)"
 
 echo "== BSP frames:"; ev "$FRAMES"
 echo "== toggle to scrolling:"
@@ -101,6 +102,37 @@ echo "== focus up within stack:"
 ev "Main.extensionManager.lookup(\"$UUID\").stateObj._focusNeighbor(\"y\",-1)"
 sleep 1
 echo "== strip state:"; ev "$STRIP"
+
+echo "== cycle width preset (0.5 -> 0.667):"
+ev "Main.extensionManager.lookup(\"$UUID\").stateObj._cycleColumnWidth()"
+sleep 1
+ev "$STRIP"
+echo "== cycle width preset (0.667 -> 1.0; CHARLIE should park, vis=false):"
+ev "Main.extensionManager.lookup(\"$UUID\").stateObj._cycleColumnWidth()"
+sleep 1
+ev "$STRIP"
+ev "$FRAMES"
+echo "== cycle width preset (1.0 -> 0.333 wrap):"
+ev "Main.extensionManager.lookup(\"$UUID\").stateObj._cycleColumnWidth()"
+sleep 1
+ev "$STRIP"
+
+echo "== fold width drag (+300px on focused column right edge):"
+ev "(()=>{const e=Main.extensionManager.lookup(\"$UUID\").stateObj;const w=($FIND)(\"ALPHA\");const ws=global.workspace_manager.get_active_workspace();const a=e._appliedRects.get(w);e._foldStripResize(w,ws,{right:true},a,{x:a.x,y:a.y,width:a.width+300,height:a.height});e._retileActiveWorkspace();return JSON.stringify(a);})()"
+sleep 1
+ev "$STRIP"
+ev "$FRAMES"
+
+echo "== fold stack heights (+150px on ALPHA bottom edge; weights shift to ALPHA):"
+ev "(()=>{const e=Main.extensionManager.lookup(\"$UUID\").stateObj;const w=($FIND)(\"ALPHA\");const ws=global.workspace_manager.get_active_workspace();const a=e._appliedRects.get(w);e._foldStripResize(w,ws,{bottom:true},a,{x:a.x,y:a.y,width:a.width,height:a.height+150});e._retileActiveWorkspace();return 0;})()"
+sleep 1
+ev "$STRIP"
+ev "$FRAMES"
+
+echo "== equalize resets stack weights:"
+ev "Main.extensionManager.lookup(\"$UUID\").stateObj._equalizeRatios()"
+sleep 1
+ev "$STRIP"
 
 echo "== toggle back to bsp:"
 ev "Main.extensionManager.lookup(\"$UUID\").stateObj._toggleLayoutMode()"
