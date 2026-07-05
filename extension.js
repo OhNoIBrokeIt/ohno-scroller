@@ -7,6 +7,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const KEYBINDINGS = [
     'toggle-tiling',
+    'toggle-layout-mode',
     'retile-workspace',
     'equalize-ratios',
     'focus-column-left',
@@ -18,7 +19,11 @@ const KEYBINDINGS = [
     'move-window-up',
     'move-window-down',
     'move-window-new-column',
+    'stack-window-left',
+    'stack-window-right',
 ];
+
+const LAYOUT_MODES = new Set(['bsp', 'scrolling']);
 
 const NORMAL_WINDOW_TYPES = new Set([
     Meta.WindowType.NORMAL,
@@ -43,6 +48,15 @@ const DRIFT_SIZE_TOLERANCE = 32;
 // stop fighting it. Any layout change (new target rect) or a manual
 // retile-workspace resets the count.
 const DRIFT_CORRECTION_LIMIT = 3;
+// Bounds for a scrolling column's width as a fraction of the work area.
+const COLUMN_WIDTH_MIN = 0.2;
+const COLUMN_WIDTH_MAX = 1.0;
+// Mutter refuses to place a frame with less than this many pixels visible
+// (measured empirically on Mutter 50: user-op placement clamps to exactly
+// 75px on-screen; non-user-op placement forces the window fully on-screen).
+// Strip columns that should sit fully off-screen are therefore "parked" at
+// this legal edge position with their actor hidden.
+const MUTTER_MIN_ONSCREEN = 75;
 // Which window edges each pointer resize op drags. Moves and keyboard resizes
 // are absent on purpose: they get no ratio fold and simply snap back on the
 // retile that follows the grab.
@@ -66,6 +80,9 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._closingWindows = new Set();
         this._closingWindowSourceIds = new Map();
         this._states = new Map();
+        this._workspaceModes = new Map();
+        this._stripClips = new Map();
+        this._parkedWindows = new Set();
         this._appliedRects = new Map();
         this._correctionHistory = new Map();
         this._grabbedWindow = null;
@@ -102,7 +119,16 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._pendingRetileSignals.clear();
         this._closingWindows.clear();
         this._closingWindowSourceIds.clear();
+        for (const window of [...this._stripClips.keys()])
+            this._unclipStripWindow(window);
+
+        for (const window of [...this._parkedWindows])
+            this._unparkStripWindow(window);
+
         this._states.clear();
+        this._workspaceModes.clear();
+        this._stripClips.clear();
+        this._parkedWindows.clear();
         this._appliedRects.clear();
         this._correctionHistory.clear();
         this._grabbedWindow = null;
@@ -149,8 +175,26 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         });
         this._connect(global.display, 'grab-op-end', (_display, window, op) => {
             this._grabbedWindow = null;
+
+            // In scrolling mode a drag-drop re-slots the window as its own
+            // column at the nearest boundary (possibly on another monitor).
+            if (op === Meta.GrabOp.MOVING && this._handleStripDrop(window)) {
+                this._queueRetile();
+                return;
+            }
+
             this._applyGrabbedGeometry(window, op);
             this._queueRetile();
+        });
+        // Overview previews render through the live actors, so monitor clips
+        // must lift while the overview is visible.
+        this._connect(Main.overview, 'showing', () => {
+            for (const {actor} of this._stripClips.values())
+                actor.remove_clip();
+        });
+        this._connect(Main.overview, 'hidden', () => {
+            for (const window of this._stripClips.keys())
+                this._refreshStripClip(window);
         });
         this._connect(this._settings, 'changed', (_settings, key) => {
             if (key === 'tiling-enabled' || key === 'gap-size')
@@ -161,6 +205,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     _addKeybindings() {
         const handlers = {
             'toggle-tiling': () => this._toggleTiling(),
+            'toggle-layout-mode': () => this._toggleLayoutMode(),
             'retile-workspace': () => {
                 // An explicit retile is the user overruling any window that
                 // was left alone after fighting its tile; give those windows
@@ -178,6 +223,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             'move-window-up': () => this._moveFocusedWindow('y', -1),
             'move-window-down': () => this._moveFocusedWindow('y', 1),
             'move-window-new-column': () => this._moveFocusedWindowToNewColumn(),
+            'stack-window-left': () => this._stackFocusedWindow(-1),
+            'stack-window-right': () => this._stackFocusedWindow(1),
         };
 
         for (const name of KEYBINDINGS) {
@@ -204,8 +251,92 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._settings.set_boolean('tiling-enabled', !this._settings.get_boolean('tiling-enabled'));
     }
 
-    // Reset every split on the active workspace back to 50/50 — the undo
-    // for accumulated resize-to-ratio adjustments.
+    // A workspace's layout mode is decided lazily from the default and then
+    // sticks to the workspace object for the session, so changing the default
+    // never yanks the layout out from under an existing workspace.
+    _workspaceMode(workspace) {
+        let mode = this._workspaceModes.get(workspace);
+        if (!mode) {
+            mode = this._settings.get_string('default-layout-mode');
+            if (!LAYOUT_MODES.has(mode))
+                mode = 'bsp';
+            this._workspaceModes.set(workspace, mode);
+        }
+
+        return mode;
+    }
+
+    _toggleLayoutMode() {
+        if (!this._tilingEnabled())
+            return;
+
+        const workspace = this._activeWorkspace();
+        const next = this._workspaceMode(workspace) === 'scrolling' ? 'bsp' : 'scrolling';
+        this._workspaceModes.set(workspace, next);
+
+        const gap = this._settings.get_int('gap-size');
+        for (let monitor = 0; monitor < global.display.get_n_monitors(); monitor++) {
+            const state = this._stateFor(workspace, monitor);
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+
+            if (next === 'scrolling')
+                this._convertTreeToStrip(state, workArea, gap);
+            else
+                this._convertStripToTree(state, workArea, gap);
+        }
+
+        this._log(`workspace ${workspace.index()} layout mode -> ${next}`);
+        this._correctionHistory.clear();
+        this._retileActiveWorkspace();
+    }
+
+    // BSP -> strip keeps the on-screen spatial order: leaves become columns
+    // sorted by tile center. Strip -> BSP feeds windows left-to-right,
+    // top-to-bottom through the ordinary insertion path. Per the design, the
+    // abandoned mode's state is discarded, not maintained in parallel.
+    _convertTreeToStrip(state, workArea, gap) {
+        const rects = this._layoutRects(state.root, this._insetRect(workArea, gap), gap);
+        rects.sort((a, b) => {
+            const ax = a.rect.x + a.rect.width / 2;
+            const bx = b.rect.x + b.rect.width / 2;
+            if (ax !== bx)
+                return ax - bx;
+
+            return (a.rect.y + a.rect.height / 2) - (b.rect.y + b.rect.height / 2);
+        });
+
+        const width = this._defaultColumnWidth();
+        const strip = this._newStrip();
+        strip.columns = rects.map(({window}) => this._newColumn([window], width));
+
+        const focused = strip.columns.findIndex(column => column.windows.includes(state.activeWindow));
+        strip.focusColumn = focused >= 0 ? focused : (strip.columns.length > 0 ? 0 : -1);
+
+        state.strip = strip;
+        state.root = null;
+    }
+
+    _convertStripToTree(state, workArea, gap) {
+        const windows = this._stripWindows(state.strip);
+        const focused = this._stripFocusedWindow(state.strip);
+
+        for (const window of windows) {
+            this._unclipStripWindow(window);
+            this._unparkStripWindow(window);
+        }
+
+        state.strip = null;
+        state.root = null;
+        for (const window of windows)
+            this._insertWindow(state, window, workArea, gap);
+
+        if (focused)
+            state.activeWindow = focused;
+    }
+
+    // Reset every split on the active workspace back to 50/50 (BSP) or every
+    // stack back to equal heights (scrolling) — the undo for accumulated
+    // resize adjustments.
     _equalizeRatios() {
         if (!this._tilingEnabled())
             return;
@@ -214,8 +345,12 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (!perMonitor)
             return;
 
-        for (const state of perMonitor.values())
+        for (const state of perMonitor.values()) {
             this._resetRatios(state.root);
+
+            for (const column of state.strip?.columns ?? [])
+                column.heightWeights = column.windows.map(() => 1);
+        }
 
         this._retileActiveWorkspace();
     }
@@ -289,7 +424,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         }
 
         if (!perMonitor.has(monitor))
-            perMonitor.set(monitor, {root: null, activeWindow: null});
+            perMonitor.set(monitor, {root: null, strip: null, activeWindow: null});
 
         return perMonitor.get(monitor);
     }
@@ -315,8 +450,34 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             return;
 
         const workspace = window.get_workspace();
-        const monitor = window.get_monitor();
-        const state = this._stateFor(workspace, monitor);
+
+        if (this._workspaceMode(workspace) === 'scrolling') {
+            const located = this._locateInStrips(workspace, window);
+
+            if (located) {
+                const {state, at} = located;
+                const strip = state.strip;
+                const column = strip.columns[at.column];
+                const moved = strip.focusColumn !== at.column || column.focusIndex !== at.index;
+
+                strip.focusColumn = at.column;
+                column.focusIndex = at.index;
+                state.activeWindow = window;
+
+                // The focused column must always be centered; any focus that
+                // arrives from outside our own handlers (click, alt-tab,
+                // overview) scrolls the strip.
+                if (moved && workspace === this._activeWorkspace())
+                    this._queueRetile();
+            } else if (this._tilingEnabled() && workspace === this._activeWorkspace()) {
+                this._log(`focused window '${window.get_title() ?? '?'}' missing from strip; re-admitting`);
+                this._queueRetile();
+            }
+
+            return;
+        }
+
+        const state = this._stateFor(workspace, window.get_monitor());
 
         if (this._containsWindow(state.root, window)) {
             state.activeWindow = window;
@@ -327,6 +488,20 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             this._log(`focused window '${window.get_title() ?? '?'}' missing from layout; re-admitting`);
             this._queueRetile();
         }
+    }
+
+    // Find the (state, position) of a window in any of the workspace's
+    // strips. Strips are monitor-sticky, so all monitors are searched rather
+    // than trusting get_monitor() for scrolled-out windows.
+    _locateInStrips(workspace, window) {
+        for (let monitor = 0; monitor < global.display.get_n_monitors(); monitor++) {
+            const state = this._stateFor(workspace, monitor);
+            const at = this._findInStrip(state.strip, window);
+            if (at)
+                return {state, monitor, at};
+        }
+
+        return null;
     }
 
     _tileableWindows(workspace, monitor) {
@@ -397,6 +572,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             window.connect('unmanaged', () => {
                 this._clearPendingWindowRetile(window);
                 this._disconnectWindowSignals(window);
+                this._unclipStripWindow(window);
+                this._parkedWindows.delete(window);
                 this._correctionHistory.delete(window);
                 const wasPlaced = this._appliedRects.delete(window);
                 const wasInLayout = this._removeWindowFromStates(window);
@@ -455,6 +632,11 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
         for (const perMonitor of this._states.values()) {
             for (const state of perMonitor.values()) {
+                if (this._findInStrip(state.strip, window)) {
+                    removed = true;
+                    this._removeFromStrip(state, window);
+                }
+
                 const previous = this._leafWindows(state.root);
                 const remaining = previous
                     .filter(item => item !== window);
@@ -471,6 +653,34 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         }
 
         return removed;
+    }
+
+    // Closing a window collapses its column if empty; focus falls back to
+    // the previous column (per the design) and the follow-up retile
+    // re-centers on it.
+    _removeFromStrip(state, window) {
+        const strip = state.strip;
+        const at = this._findInStrip(strip, window);
+        if (!at)
+            return;
+
+        const wasFocused = this._stripFocusedWindow(strip) === window;
+        const column = strip.columns[at.column];
+        column.windows.splice(at.index, 1);
+        column.heightWeights.splice(at.index, 1);
+        column.focusIndex = Math.max(0, Math.min(column.focusIndex, column.windows.length - 1));
+
+        if (column.windows.length === 0) {
+            strip.columns.splice(at.column, 1);
+            if (wasFocused)
+                strip.focusColumn = at.column - 1;
+        }
+
+        strip.focusColumn = Math.max(0, Math.min(strip.focusColumn, strip.columns.length - 1));
+        if (strip.columns.length === 0)
+            strip.focusColumn = -1;
+
+        state.activeWindow = this._stripFocusedWindow(strip);
     }
 
     // App-driven geometry changes (session restore, late self-resize) used to
@@ -608,18 +818,78 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             return;
 
         const workspace = this._activeWorkspace();
+        const mode = this._workspaceMode(workspace);
         const monitorCount = global.display.get_n_monitors();
         const gap = this._settings.get_int('gap-size');
+
+        if (mode === 'scrolling') {
+            this._retileStrips(workspace, monitorCount, gap);
+            return;
+        }
 
         for (let monitor = 0; monitor < monitorCount; monitor++) {
             const windows = this._tileableWindows(workspace, monitor);
             const state = this._stateFor(workspace, monitor);
             const workArea = workspace.get_work_area_for_monitor(monitor);
 
-            this._log(`retile ws=${workspace.index()} monitor=${monitor} tileable=${windows.length}`);
+            this._log(`retile ws=${workspace.index()} monitor=${monitor} mode=bsp tileable=${windows.length}`);
 
             this._syncWindows(state, windows, workArea, gap);
             this._layout(workArea, gap, state);
+        }
+    }
+
+    // Strip membership must be sticky: a scrolled-out column sits at
+    // coordinates that spatially belong to a neighboring monitor, so
+    // get_monitor() cannot be trusted for windows a strip already owns.
+    // Only windows no strip has claimed are assigned by monitor.
+    _retileStrips(workspace, monitorCount, gap) {
+        const workspaceWindows = global.display
+            .get_tab_list(Meta.TabList.NORMAL_ALL, workspace)
+            .filter(window => !this._closingWindows.has(window))
+            .filter(window => this._isTileable(window));
+
+        for (const window of workspaceWindows)
+            this._trackWindow(window);
+
+        const claimed = new Map();
+        for (let monitor = 0; monitor < monitorCount; monitor++) {
+            const state = this._stateFor(workspace, monitor);
+            for (const window of this._stripWindows(state.strip))
+                claimed.set(window, monitor);
+        }
+
+        const perMonitor = Array.from({length: monitorCount}, () => []);
+        for (const window of workspaceWindows) {
+            const monitor = claimed.get(window) ?? window.get_monitor();
+            if (monitor >= 0 && monitor < monitorCount)
+                perMonitor[monitor].push(window);
+        }
+
+        const placed = new Set();
+        for (let monitor = 0; monitor < monitorCount; monitor++) {
+            const state = this._stateFor(workspace, monitor);
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+
+            this._log(`retile ws=${workspace.index()} monitor=${monitor} mode=scrolling tileable=${perMonitor[monitor].length}`);
+
+            this._syncStrip(state, perMonitor[monitor]);
+            this._layoutStrip(state, workArea, gap, monitor);
+
+            for (const window of this._stripWindows(state.strip))
+                placed.add(window);
+        }
+
+        // Windows that left every strip this pass (closed, floated, mode
+        // change elsewhere) must not keep a stale monitor clip or stay
+        // parked-invisible.
+        for (const window of [...this._stripClips.keys()]) {
+            if (!placed.has(window) && window.get_workspace() === workspace)
+                this._unclipStripWindow(window);
+        }
+        for (const window of [...this._parkedWindows]) {
+            if (!placed.has(window) && window.get_workspace() === workspace)
+                this._unparkStripWindow(window);
         }
     }
 
@@ -642,17 +912,24 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (!state.root)
             return;
 
+        const placements = this._layoutRects(state.root, this._insetRect(workArea, gap), gap);
+        this._applyPlacements(placements, workArea, false);
+    }
+
+    _applyPlacements(placements, workArea, stripPlacement) {
         // Mark our own placement pass so the geometry signals it provokes do not
         // bounce back in as fresh retile requests.
         this._inLayout = true;
         try {
-            for (const {window, rect} of this._layoutRects(state.root, this._insetRect(workArea, gap), gap)) {
+            for (const {window, rect} of placements) {
                 if (!this._canPlace(window)) {
                     this._log('placement skipped: window is not currently placeable');
                     continue;
                 }
 
-                const safeRect = this._safeRect(rect, workArea);
+                const safeRect = stripPlacement
+                    ? this._safeStripRect(rect, workArea)
+                    : this._safeRect(rect, workArea);
 
                 if (!safeRect) {
                     this._log('placement skipped: computed rect was degenerate/non-finite');
@@ -674,8 +951,11 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                     height: safeRect.height,
                 });
 
+                // Strip placement must be a user op: Mutter forces non-user
+                // placements fully on-screen, which would fold the whole
+                // strip onto the monitor.
                 window.move_resize_frame(
-                    false,
+                    stripPlacement,
                     safeRect.x,
                     safeRect.y,
                     safeRect.width,
@@ -685,6 +965,43 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         } finally {
             this._inLayout = false;
         }
+    }
+
+    // The strip variant of _safeRect: vertical bounds and sizes clamp to the
+    // work area exactly like BSP tiles, but horizontal position roams — only
+    // clamped into the band Mutter will actually honor (at least
+    // MUTTER_MIN_ONSCREEN pixels visible), so the recorded applied rect is
+    // always exactly where the frame lands and drift correction stays honest.
+    _safeStripRect(rect, bounds) {
+        if (![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite))
+            return null;
+
+        let width = Math.floor(rect.width);
+        let height = Math.floor(rect.height);
+        let clamped = false;
+
+        if (width < MIN_TILE_SIZE) {
+            width = Math.min(MIN_TILE_SIZE, bounds.width);
+            clamped = true;
+        }
+        if (width > bounds.width) {
+            width = bounds.width;
+            clamped = true;
+        }
+        if (height < MIN_TILE_SIZE) {
+            height = Math.min(MIN_TILE_SIZE, bounds.height);
+            clamped = true;
+        }
+        if (height > bounds.height) {
+            height = bounds.height;
+            clamped = true;
+        }
+
+        const y = Math.max(bounds.y, Math.min(Math.floor(rect.y), bounds.y + bounds.height - height));
+        const x = Math.max(bounds.x + MUTTER_MIN_ONSCREEN - width,
+            Math.min(Math.floor(rect.x), bounds.x + bounds.width - MUTTER_MIN_ONSCREEN));
+
+        return {x, y, width, height, clamped};
     }
 
     // Pick the tile nearest to `window` whose center lies in `direction`
@@ -743,6 +1060,19 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             return;
 
         const workspace = window.get_workspace();
+
+        if (this._workspaceMode(workspace) === 'scrolling') {
+            const located = this._locateInStrips(workspace, window);
+            if (!located)
+                return;
+
+            const target = this._stripNeighbor(located.state.strip, located.at, axis, direction);
+            if (target)
+                this._focusStripWindow(located.state, target);
+
+            return;
+        }
+
         const monitor = window.get_monitor();
         const state = this._stateFor(workspace, monitor);
         const neighbor = this._spatialNeighbor(state, workspace, monitor, window, axis, direction);
@@ -751,6 +1081,34 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             state.activeWindow = neighbor;
             neighbor.activate(global.get_current_time());
         }
+    }
+
+    // x steps between columns (landing on the target column's remembered
+    // window); y steps within the focused column's stack, stopping at the
+    // ends.
+    _stripNeighbor(strip, at, axis, direction) {
+        if (axis === 'y') {
+            const column = strip.columns[at.column];
+            return column.windows[at.index + direction] ?? null;
+        }
+
+        const column = strip.columns[at.column + direction];
+        if (!column)
+            return null;
+
+        return column.windows[Math.min(column.focusIndex, column.windows.length - 1)] ?? null;
+    }
+
+    _focusStripWindow(state, window) {
+        const at = this._findInStrip(state.strip, window);
+        if (!at)
+            return;
+
+        state.strip.focusColumn = at.column;
+        state.strip.columns[at.column].focusIndex = at.index;
+        state.activeWindow = window;
+        window.activate(global.get_current_time());
+        this._queueRetile();
     }
 
     _moveFocusedWindow(axis, direction) {
@@ -762,6 +1120,15 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             return;
 
         const workspace = window.get_workspace();
+
+        if (this._workspaceMode(workspace) === 'scrolling') {
+            const located = this._locateInStrips(workspace, window);
+            if (located)
+                this._moveInStrip(located.state, window, located.at, axis, direction);
+
+            return;
+        }
+
         const monitor = window.get_monitor();
         const state = this._stateFor(workspace, monitor);
         const neighbor = this._spatialNeighbor(state, workspace, monitor, window, axis, direction);
@@ -780,6 +1147,79 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         window.activate(global.get_current_time());
     }
 
+    // x reorders whole columns; y reorders within the stack. Height weights
+    // stay with the slots so a user-sized layout keeps its shape as windows
+    // move through it.
+    _moveInStrip(state, window, at, axis, direction) {
+        const strip = state.strip;
+
+        if (axis === 'x') {
+            const target = at.column + direction;
+            if (target < 0 || target >= strip.columns.length)
+                return;
+
+            const [column] = strip.columns.splice(at.column, 1);
+            strip.columns.splice(target, 0, column);
+            strip.focusColumn = target;
+        } else {
+            const column = strip.columns[at.column];
+            const target = at.index + direction;
+            if (target < 0 || target >= column.windows.length)
+                return;
+
+            [column.windows[at.index], column.windows[target]] =
+                [column.windows[target], column.windows[at.index]];
+            column.focusIndex = target;
+        }
+
+        state.activeWindow = window;
+        window.activate(global.get_current_time());
+        this._queueRetile();
+    }
+
+    // Merge the focused window into the neighboring column's stack — the way
+    // stacks are built. At the strip's edge there is no neighbor; expel
+    // (move-window-new-column) is the tool for splitting back out.
+    _stackFocusedWindow(direction) {
+        if (!this._tilingEnabled())
+            return;
+
+        const window = global.display.focus_window;
+        if (!window || !this._canPlace(window))
+            return;
+
+        const workspace = window.get_workspace();
+        if (this._workspaceMode(workspace) !== 'scrolling')
+            return;
+
+        const located = this._locateInStrips(workspace, window);
+        if (!located)
+            return;
+
+        const {state, at} = located;
+        const strip = state.strip;
+        const target = strip.columns[at.column + direction];
+        if (!target)
+            return;
+
+        const source = strip.columns[at.column];
+        source.windows.splice(at.index, 1);
+        source.heightWeights.splice(at.index, 1);
+        source.focusIndex = Math.max(0, Math.min(source.focusIndex, source.windows.length - 1));
+
+        target.windows.push(window);
+        target.heightWeights.push(1);
+        target.focusIndex = target.windows.length - 1;
+
+        if (source.windows.length === 0)
+            strip.columns.splice(strip.columns.indexOf(source), 1);
+
+        strip.focusColumn = strip.columns.indexOf(target);
+        state.activeWindow = window;
+        window.activate(global.get_current_time());
+        this._queueRetile();
+    }
+
     _moveFocusedWindowToNewColumn() {
         if (!this._tilingEnabled())
             return;
@@ -789,6 +1229,30 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             return;
 
         const workspace = window.get_workspace();
+
+        if (this._workspaceMode(workspace) === 'scrolling') {
+            const located = this._locateInStrips(workspace, window);
+            if (!located)
+                return;
+
+            const {state, at} = located;
+            const strip = state.strip;
+            const column = strip.columns[at.column];
+            if (column.windows.length < 2)
+                return; // already its own column
+
+            column.windows.splice(at.index, 1);
+            column.heightWeights.splice(at.index, 1);
+            column.focusIndex = Math.max(0, Math.min(column.focusIndex, column.windows.length - 1));
+
+            strip.columns.splice(at.column + 1, 0, this._newColumn([window], this._defaultColumnWidth()));
+            strip.focusColumn = at.column + 1;
+            state.activeWindow = window;
+            window.activate(global.get_current_time());
+            this._queueRetile();
+            return;
+        }
+
         const monitor = window.get_monitor();
         const state = this._stateFor(workspace, monitor);
         const workArea = workspace.get_work_area_for_monitor(monitor);
@@ -912,6 +1376,337 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
         this._swapLeafWindows(node.first, firstWindow, secondWindow);
         this._swapLeafWindows(node.second, firstWindow, secondWindow);
+    }
+
+    _newStrip() {
+        return {columns: [], focusColumn: -1};
+    }
+
+    _newColumn(windows, widthFraction) {
+        return {
+            windows,
+            widthFraction,
+            heightWeights: windows.map(() => 1),
+            focusIndex: 0,
+        };
+    }
+
+    _defaultColumnWidth() {
+        const percent = this._settings.get_int('column-width-percent');
+        return Math.min(COLUMN_WIDTH_MAX, Math.max(COLUMN_WIDTH_MIN, percent / 100));
+    }
+
+    _stripWindows(strip) {
+        return strip ? strip.columns.flatMap(column => column.windows) : [];
+    }
+
+    _findInStrip(strip, window) {
+        if (!strip || !window)
+            return null;
+
+        for (let column = 0; column < strip.columns.length; column++) {
+            const index = strip.columns[column].windows.indexOf(window);
+            if (index >= 0)
+                return {column, index};
+        }
+
+        return null;
+    }
+
+    _stripFocusedWindow(strip) {
+        const column = strip?.columns[strip.focusColumn];
+        if (!column)
+            return null;
+
+        return column.windows[Math.min(column.focusIndex, column.windows.length - 1)] ?? null;
+    }
+
+    _syncStrip(state, windows) {
+        if (!state.strip)
+            state.strip = this._newStrip();
+
+        const strip = state.strip;
+        const windowSet = new Set(windows);
+        const focusedBefore = this._stripFocusedWindow(strip);
+
+        // Drop windows that left (closed, minimized, floated, re-slotted),
+        // collapsing empty columns and keeping weights aligned to survivors.
+        for (const column of strip.columns) {
+            const kept = [];
+            const weights = [];
+            column.windows.forEach((window, index) => {
+                if (!windowSet.has(window))
+                    return;
+
+                kept.push(window);
+                weights.push(column.heightWeights[index] ?? 1);
+            });
+            column.windows = kept;
+            column.heightWeights = weights;
+            column.focusIndex = Math.max(0, Math.min(column.focusIndex, kept.length - 1));
+        }
+        strip.columns = strip.columns.filter(column => column.windows.length > 0);
+
+        const stayColumn = focusedBefore
+            ? strip.columns.findIndex(column => column.windows.includes(focusedBefore))
+            : -1;
+        strip.focusColumn = stayColumn >= 0
+            ? stayColumn
+            : Math.max(0, Math.min(strip.focusColumn, strip.columns.length - 1));
+
+        // Admit newcomers: each becomes its own column immediately right of
+        // the focused one and takes focus (the design's new-window rule).
+        const assigned = new Set(this._stripWindows(strip));
+        const fresh = windows.filter(window => !assigned.has(window));
+
+        if (strip.columns.length === 0 && fresh.length > 1) {
+            // Bulk admission (mode default at login, first retile of a
+            // workspace): order by current position so the strip matches
+            // what is already on screen.
+            fresh.sort((a, b) => {
+                const fa = a.get_frame_rect();
+                const fb = b.get_frame_rect();
+                const ax = fa.x + fa.width / 2;
+                const bx = fb.x + fb.width / 2;
+                if (ax !== bx)
+                    return ax - bx;
+
+                return (fa.y + fa.height / 2) - (fb.y + fb.height / 2);
+            });
+        }
+
+        const width = this._defaultColumnWidth();
+        for (const window of fresh) {
+            const at = strip.columns.length === 0 ? 0 : strip.focusColumn + 1;
+            strip.columns.splice(at, 0, this._newColumn([window], width));
+            strip.focusColumn = at;
+        }
+
+        if (strip.columns.length === 0)
+            strip.focusColumn = -1;
+
+        state.activeWindow = this._stripFocusedWindow(strip);
+    }
+
+    _layoutStrip(state, workArea, gap, monitor) {
+        const strip = state.strip;
+        if (!strip || strip.columns.length === 0)
+            return;
+
+        const inner = this._insetRect(workArea, gap);
+        const widths = strip.columns.map(column =>
+            Math.max(MIN_TILE_SIZE, Math.floor(inner.width * column.widthFraction)));
+
+        const offsets = [];
+        let cursor = 0;
+        for (const width of widths) {
+            offsets.push(cursor);
+            cursor += width + gap;
+        }
+
+        // Always-center policy: the focused column's center sits at the
+        // work-area center; everything else falls where the strip puts it.
+        strip.focusColumn = Math.max(0, Math.min(strip.focusColumn, strip.columns.length - 1));
+        const focusedCenter = offsets[strip.focusColumn] + widths[strip.focusColumn] / 2;
+        const origin = Math.round(inner.x + inner.width / 2 - focusedCenter);
+
+        const placements = [];
+        strip.columns.forEach((column, index) => {
+            const x = origin + offsets[index];
+            const columnRect = {
+                x,
+                y: inner.y,
+                width: widths[index],
+                height: inner.height,
+            };
+            // Parked = the column's ideal spot shares no pixels with the work
+            // area. Mutter cannot represent that as a real frame position, so
+            // the frame sits at the legal edge and the actor hides instead.
+            const parked = x + widths[index] <= workArea.x ||
+                x >= workArea.x + workArea.width;
+
+            for (const placement of this._stackRects(column, columnRect, gap))
+                placements.push({...placement, parked});
+        });
+
+        this._applyPlacements(placements, workArea, true);
+
+        for (const {window, parked} of placements) {
+            if (parked) {
+                this._parkStripWindow(window);
+            } else {
+                this._unparkStripWindow(window);
+                this._clipStripWindow(window, monitor);
+            }
+        }
+    }
+
+    _parkStripWindow(window) {
+        const actor = window.get_compositor_private?.();
+        if (!actor)
+            return;
+
+        this._parkedWindows.add(window);
+        this._unclipStripWindow(window);
+        actor.hide();
+    }
+
+    _unparkStripWindow(window) {
+        if (!this._parkedWindows.delete(window))
+            return;
+
+        const actor = window.get_compositor_private?.();
+        if (actor)
+            actor.show();
+    }
+
+    _stackRects(column, rect, gap) {
+        const count = column.windows.length;
+        if (count === 0)
+            return [];
+
+        const totalWeight = column.heightWeights.reduce((sum, weight) => sum + weight, 0) || count;
+        const available = Math.max(0, rect.height - gap * (count - 1));
+        const rects = [];
+        let y = rect.y;
+
+        column.windows.forEach((window, index) => {
+            const height = index === count - 1
+                ? Math.max(0, rect.y + rect.height - y) // remainder absorbs rounding
+                : Math.floor(available * ((column.heightWeights[index] ?? 1) / totalWeight));
+
+            rects.push({window, rect: {x: rect.x, y, width: rect.width, height}});
+            y += height + gap;
+        });
+
+        return rects;
+    }
+
+    // A completed move-drag in scrolling mode re-slots the window as its own
+    // column at the boundary nearest the drop, on whichever monitor it was
+    // dropped. Returns false when the window is not strip-managed so the
+    // ordinary grab handling can run.
+    _handleStripDrop(window) {
+        if (!this._tilingEnabled() || !window)
+            return false;
+
+        const workspace = window.get_workspace();
+        if (!workspace || this._workspaceMode(workspace) !== 'scrolling')
+            return false;
+
+        if (!this._isTileable(window))
+            return false;
+
+        const located = this._locateInStrips(workspace, window);
+        if (!located)
+            return false;
+
+        const monitorCount = global.display.get_n_monitors();
+        let targetMonitor = window.get_monitor();
+        if (targetMonitor < 0 || targetMonitor >= monitorCount)
+            targetMonitor = located.monitor;
+
+        const frame = window.get_frame_rect();
+        const dropCenter = frame.x + frame.width / 2;
+
+        const {state: oldState, at} = located;
+        const oldStrip = oldState.strip;
+        const oldColumn = oldStrip.columns[at.column];
+        oldColumn.windows.splice(at.index, 1);
+        oldColumn.heightWeights.splice(at.index, 1);
+        oldColumn.focusIndex = Math.max(0, Math.min(oldColumn.focusIndex, oldColumn.windows.length - 1));
+        if (oldColumn.windows.length === 0)
+            oldStrip.columns.splice(oldStrip.columns.indexOf(oldColumn), 1);
+        oldStrip.focusColumn = Math.max(0, Math.min(oldStrip.focusColumn, oldStrip.columns.length - 1));
+        if (oldStrip.columns.length === 0)
+            oldStrip.focusColumn = -1;
+
+        const targetState = this._stateFor(workspace, targetMonitor);
+        if (!targetState.strip)
+            targetState.strip = this._newStrip();
+
+        const strip = targetState.strip;
+        let insertAt = strip.columns.length;
+        for (let index = 0; index < strip.columns.length; index++) {
+            const first = strip.columns[index].windows[0];
+            const applied = first ? this._appliedRects.get(first) : null;
+            if (applied && dropCenter < applied.x + applied.width / 2) {
+                insertAt = index;
+                break;
+            }
+        }
+
+        strip.columns.splice(insertAt, 0, this._newColumn([window], this._defaultColumnWidth()));
+        strip.focusColumn = insertAt;
+        targetState.activeWindow = window;
+        this._log(`drop: window re-slotted as column ${insertAt} on monitor ${targetMonitor}`);
+        return true;
+    }
+
+    // Off-screen strip columns spatially overlap neighboring monitors, so
+    // every strip window's actor is clipped to its own monitor. Clips follow
+    // the actor (positions settle asynchronously on Wayland) and lift while
+    // the overview is visible because previews paint through the live actor.
+    _clipStripWindow(window, monitor) {
+        const actor = window.get_compositor_private?.();
+        if (!actor || typeof actor.connect !== 'function')
+            return;
+
+        let entry = this._stripClips.get(window);
+        if (entry && entry.actor !== actor) {
+            this._unclipStripWindow(window);
+            entry = null;
+        }
+
+        if (!entry) {
+            entry = {
+                actor,
+                monitor,
+                xId: actor.connect('notify::x', () => this._refreshStripClip(window)),
+                yId: actor.connect('notify::y', () => this._refreshStripClip(window)),
+                destroyId: actor.connect('destroy', () => this._stripClips.delete(window)),
+            };
+            this._stripClips.set(window, entry);
+        }
+
+        entry.monitor = monitor;
+        this._refreshStripClip(window);
+    }
+
+    _refreshStripClip(window) {
+        const entry = this._stripClips.get(window);
+        if (!entry)
+            return;
+
+        const monitorRect = Main.layoutManager.monitors[entry.monitor];
+        if (!monitorRect || Main.overview.visible) {
+            entry.actor.remove_clip();
+            return;
+        }
+
+        entry.actor.set_clip(
+            monitorRect.x - entry.actor.x,
+            monitorRect.y - entry.actor.y,
+            monitorRect.width,
+            monitorRect.height
+        );
+    }
+
+    _unclipStripWindow(window) {
+        const entry = this._stripClips.get(window);
+        if (!entry)
+            return;
+
+        this._stripClips.delete(window);
+
+        try {
+            entry.actor.disconnect(entry.xId);
+            entry.actor.disconnect(entry.yId);
+            entry.actor.disconnect(entry.destroyId);
+            entry.actor.remove_clip();
+        } catch (_error) {
+            // The actor may already be gone; its handlers died with it.
+        }
     }
 
     _layoutRects(node, rect, gap) {

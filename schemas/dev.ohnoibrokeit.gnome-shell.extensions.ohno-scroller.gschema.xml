@@ -13,10 +13,19 @@
       <description>Pixels between tiled windows and columns.</description>
     </key>
     <key name="column-width-percent" type="i">
-      <default>100</default>
+      <default>50</default>
       <range min="25" max="100"/>
-      <summary>Reserved column width percent</summary>
-      <description>Reserved for compatibility with older preferences; the current bounded split layout does not use it.</description>
+      <summary>Default column width percent (scrolling mode)</summary>
+      <description>Width of a newly created scrolling column as a percent of the monitor work area.</description>
+    </key>
+    <key name="default-layout-mode" type="s">
+      <choices>
+        <choice value="bsp"/>
+        <choice value="scrolling"/>
+      </choices>
+      <default>'bsp'</default>
+      <summary>Layout mode new workspaces start in</summary>
+      <description>Bounded splits (bsp) or scrolling columns. Each workspace can be toggled at runtime with the toggle-layout-mode shortcut.</description>
     </key>
     <key name="debug-logging" type="b">
       <default>false</default>
@@ -26,6 +35,18 @@
     <key name="toggle-tiling" type="as">
       <default>['&lt;Super&gt;y']</default>
       <summary>Toggle tiling</summary>
+    </key>
+    <key name="toggle-layout-mode" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;y']</default>
+      <summary>Toggle the active workspace between split and scrolling layout</summary>
+    </key>
+    <key name="stack-window-left" type="as">
+      <default>['&lt;Super&gt;comma']</default>
+      <summary>Merge focused window into the column to the left (scrolling mode)</summary>
+    </key>
+    <key name="stack-window-right" type="as">
+      <default>['&lt;Super&gt;period']</default>
+      <summary>Merge focused window into the column to the right (scrolling mode)</summary>
     </key>
     <key name="retile-workspace" type="as">
       <default>['&lt;Super&gt;&lt;Shift&gt;y']</default>
