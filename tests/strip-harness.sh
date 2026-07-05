@@ -134,6 +134,18 @@ ev "Main.extensionManager.lookup(\"$UUID\").stateObj._equalizeRatios()"
 sleep 1
 ev "$STRIP"
 
+TRANSLATIONS="JSON.stringify(global.get_window_actors().filter(a=>a.meta_window.get_title()).map(a=>({t:a.meta_window.get_title(),tx:Math.round(a.translation_x),easing:a.get_transition(\"translation-x\")!==null})))"
+echo "== animations enabled in this shell:"
+ev "imports.gi.St.Settings.get().enable_animations"
+echo "== scroll right (focus CHARLIE); mid-flight probe (informational, racy):"
+ev "Main.extensionManager.lookup(\"$UUID\").stateObj._focusNeighbor(\"x\",1)"
+ev "$TRANSLATIONS"
+sleep 1
+echo "== translations settled (all tx=0, easing=false expected):"
+ev "$TRANSLATIONS"
+echo "== frames after animated scroll (CHARLIE centered expected):"
+ev "$FRAMES"
+
 echo "== toggle back to bsp:"
 ev "Main.extensionManager.lookup(\"$UUID\").stateObj._toggleLayoutMode()"
 sleep 1

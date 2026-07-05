@@ -1,6 +1,8 @@
+import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
+import St from 'gi://St';
 
 import {Extension as ExtensionBase} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -55,6 +57,8 @@ const COLUMN_WIDTH_MAX = 1.0;
 // Width presets the cycle keybinding steps a scrolling column through; from
 // a drag-adjusted width the cycle resumes at the next-larger preset.
 const COLUMN_WIDTH_PRESETS = [1 / 3, 0.5, 2 / 3, 1.0];
+// How long a scroll eases actors to their new positions.
+const SCROLL_ANIMATION_MS = 220;
 // Mutter refuses to place a frame with less than this many pixels visible
 // (measured empirically on Mutter 50: user-op placement clamps to exactly
 // 75px on-screen; non-user-op placement forces the window fully on-screen).
@@ -86,6 +90,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._states = new Map();
         this._workspaceModes = new Map();
         this._stripClips = new Map();
+        this._stripAnimations = new Map();
         this._parkedWindows = new Set();
         this._appliedRects = new Map();
         this._correctionHistory = new Map();
@@ -123,6 +128,9 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._pendingRetileSignals.clear();
         this._closingWindows.clear();
         this._closingWindowSourceIds.clear();
+        for (const window of [...this._stripAnimations.keys()])
+            this._stopStripAnimation(window, true);
+
         for (const window of [...this._stripClips.keys()])
             this._unclipStripWindow(window);
 
@@ -132,6 +140,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._states.clear();
         this._workspaceModes.clear();
         this._stripClips.clear();
+        this._stripAnimations.clear();
         this._parkedWindows.clear();
         this._appliedRects.clear();
         this._correctionHistory.clear();
@@ -577,6 +586,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             window.connect('unmanaged', () => {
                 this._clearPendingWindowRetile(window);
                 this._disconnectWindowSignals(window);
+                this._stopStripAnimation(window);
                 this._unclipStripWindow(window);
                 this._parkedWindows.delete(window);
                 this._correctionHistory.delete(window);
@@ -1562,6 +1572,19 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 placements.push({...placement, parked});
         });
 
+        // Captured before any frame moves: where each already-placed window
+        // visually sits right now (actor position plus any in-flight scroll
+        // translation), so a pass that lands mid-animation continues smoothly
+        // from the current on-screen position. Fresh windows just appear.
+        const fromVisual = new Map();
+        if (this._animationsEnabled()) {
+            for (const {window} of placements) {
+                const actor = window.get_compositor_private?.();
+                if (actor && this._appliedRects.has(window))
+                    fromVisual.set(window, actor.x + actor.translation_x);
+            }
+        }
+
         this._applyPlacements(placements, workArea, true);
 
         for (const {window, parked} of placements) {
@@ -1570,7 +1593,118 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             } else {
                 this._unparkStripWindow(window);
                 this._clipStripWindow(window, monitor);
+
+                const applied = this._appliedRects.get(window);
+                const from = fromVisual.get(window);
+                if (applied && from !== undefined)
+                    this._animateStripWindow(window, from, applied.x);
             }
+        }
+    }
+
+    _animationsEnabled() {
+        return St.Settings.get().enable_animations && !Main.overview.visible;
+    }
+
+    // Scroll animation: frames jump to their final rects during placement
+    // (input follows reality); the actor then eases a compositor-side
+    // translation_x from its old visual position back to zero, so Mutter's
+    // placement constraints never see an intermediate position.
+    _animateStripWindow(window, fromVisualX, targetX) {
+        const actor = window.get_compositor_private?.();
+        if (!actor || typeof actor.connect !== 'function')
+            return;
+
+        this._stopStripAnimation(window);
+
+        const settle = () => {
+            const delta = fromVisualX - actor.x;
+
+            if (Math.abs(delta) < 1) {
+                actor.translation_x = 0;
+                this._stripAnimations.delete(window);
+                return;
+            }
+
+            actor.translation_x = delta;
+            this._stripAnimations.set(window, {actor, notifyId: 0, destroyId: 0, timeoutId: 0});
+            actor.ease({
+                translation_x: 0,
+                duration: SCROLL_ANIMATION_MS,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+                onStopped: () => this._stripAnimations.delete(window),
+            });
+        };
+
+        if (actor.x === targetX) {
+            settle();
+            return;
+        }
+
+        // The compositor moves the actor to its new frame position
+        // asynchronously; pin the current visual position until it lands (or
+        // a fallback fires, e.g. when the move was absorbed) and ease then.
+        actor.translation_x = fromVisualX - actor.x;
+
+        const entry = {actor, notifyId: 0, destroyId: 0, timeoutId: 0};
+        const fire = () => {
+            this._stripAnimations.delete(window);
+            this._clearStripAnimationEntry(entry);
+            settle();
+        };
+
+        entry.notifyId = actor.connect('notify::x', fire);
+        entry.destroyId = actor.connect('destroy', () => {
+            entry.destroyId = 0;
+            this._stripAnimations.delete(window);
+            this._clearStripAnimationEntry(entry);
+        });
+        entry.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+            entry.timeoutId = 0;
+            fire();
+            return GLib.SOURCE_REMOVE;
+        });
+        this._stripAnimations.set(window, entry);
+    }
+
+    _clearStripAnimationEntry(entry) {
+        try {
+            if (entry.notifyId)
+                entry.actor.disconnect(entry.notifyId);
+            if (entry.destroyId)
+                entry.actor.disconnect(entry.destroyId);
+        } catch (_error) {
+            // The actor may already be disposed.
+        }
+
+        entry.notifyId = 0;
+        entry.destroyId = 0;
+
+        if (entry.timeoutId) {
+            GLib.source_remove(entry.timeoutId);
+            entry.timeoutId = 0;
+        }
+    }
+
+    // Stop any pending or in-flight scroll animation. With resetTranslation
+    // the actor also snaps to its real position (park, disable).
+    _stopStripAnimation(window, resetTranslation = false) {
+        const entry = this._stripAnimations.get(window);
+        if (entry) {
+            this._stripAnimations.delete(window);
+            this._clearStripAnimationEntry(entry);
+        }
+
+        const actor = window.get_compositor_private?.();
+        if (!actor)
+            return;
+
+        try {
+            actor.remove_transition('translation-x');
+            if (resetTranslation)
+                actor.translation_x = 0;
+        } catch (_error) {
+            // Disposed actor; nothing to stop.
         }
     }
 
@@ -1579,6 +1713,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (!actor)
             return;
 
+        this._stopStripAnimation(window, true);
         this._parkedWindows.add(window);
         this._unclipStripWindow(window);
         actor.hide();
@@ -1697,6 +1832,9 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 monitor,
                 xId: actor.connect('notify::x', () => this._refreshStripClip(window)),
                 yId: actor.connect('notify::y', () => this._refreshStripClip(window)),
+                // The scroll animation moves the actor by translation, so the
+                // clip must re-anchor every animation frame too.
+                translationId: actor.connect('notify::translation-x', () => this._refreshStripClip(window)),
                 destroyId: actor.connect('destroy', () => this._stripClips.delete(window)),
             };
             this._stripClips.set(window, entry);
@@ -1717,8 +1855,11 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             return;
         }
 
+        // The clip rect lives in actor coordinates and travels with the
+        // actor's transform, so the in-flight scroll translation has to be
+        // backed out for the crop to stay glued to the monitor edge.
         entry.actor.set_clip(
-            monitorRect.x - entry.actor.x,
+            monitorRect.x - entry.actor.x - entry.actor.translation_x,
             monitorRect.y - entry.actor.y,
             monitorRect.width,
             monitorRect.height
@@ -1735,6 +1876,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         try {
             entry.actor.disconnect(entry.xId);
             entry.actor.disconnect(entry.yId);
+            entry.actor.disconnect(entry.translationId);
             entry.actor.disconnect(entry.destroyId);
             entry.actor.remove_clip();
         } catch (_error) {
