@@ -1,6 +1,6 @@
 # ohno-scroller: scrolling-columns mode — design
 
-Status: agreed 2026-07-04 (design discussion, William + Claude). Not yet built.
+Status: implemented; original design agreed 2026-07-04.
 
 ## Decisions
 
@@ -9,7 +9,7 @@ Status: agreed 2026-07-04 (design discussion, William + Claude). Not yet built.
 | Off-screen strategy | **Real window positions** (PaperWM-style). No clones, no minimize-virtualization. |
 | Mode scope | **Per-workspace**: each workspace is BSP or scrolling; every (workspace, monitor) pair owns one strip or one split tree. |
 | Stacks | **Yes, from v1.** Columns hold vertical stacks of windows. |
-| Animation | **Yes, from v1.** Actors ease during a scroll; real geometry commits once at animation end. Respects GNOME `enable-animations`. |
+| Animation | **Yes, from v1.** Real geometry commits first so input follows the final layout, while actor translation eases the visual move. Respects GNOME `enable-animations`. |
 | New windows | New column immediately **right of the focused column**; focus and scroll to it. Stacking is always explicit. |
 | Column width | New columns default to **50%** of work-area width. Per-column presets cycle 33 → 50 → 66 → 100. Edge drags fold into the column width (same philosophy as BSP ratio folding). |
 | Viewport | **Always center** the focused column (niri center-focused feel). |

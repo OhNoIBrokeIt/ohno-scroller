@@ -57,8 +57,11 @@ Preferences: `gnome-extensions prefs ohno-scroller@ohnoibrokeit.dev`
 Headless verification (never touches the live session):
 
 ```bash
-bash tests/strip-harness.sh
+make test
 ```
+
+The compatibility command `bash tests/strip-harness.sh` runs the same
+assertion-based GNOME Shell 50 automation suite.
 
 Design notes for the scrolling mode live in
 `docs/scrolling-mode-design.md`.

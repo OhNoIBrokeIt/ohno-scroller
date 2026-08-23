@@ -59,6 +59,10 @@ const COLUMN_WIDTH_MAX = 1.0;
 const COLUMN_WIDTH_PRESETS = [1 / 3, 0.5, 2 / 3, 1.0];
 // How long a scroll eases actors to their new positions.
 const SCROLL_ANIMATION_MS = 220;
+// Work-area notifications arrive in short bursts while panels and monitors
+// settle. Wait for the final geometry instead of rebuilding the same layout
+// once per intermediate notification.
+const WORKAREA_SETTLE_MS = 100;
 // Mutter refuses to place a frame with less than this many pixels visible
 // (measured empirically on Mutter 50: user-op placement clamps to exactly
 // 75px on-screen; non-user-op placement forces the window fully on-screen).
@@ -90,19 +94,27 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._states = new Map();
         this._workspaceModes = new Map();
         this._stripClips = new Map();
+        this._dirtyStripClips = new Set();
         this._stripAnimations = new Map();
         this._parkedWindows = new Set();
         this._appliedRects = new Map();
         this._correctionHistory = new Map();
+        this._forcePlacementWindows = new Set();
         this._grabbedWindow = null;
         this._inLayout = false;
         this._retileSourceId = 0;
         this._retileLaterId = 0;
+        this._stripClipLaterId = 0;
+        this._pendingRetileReasons = new Set();
+        this._lastWorkAreaSignature = this._workAreaSignature();
+        this._retilePassCount = 0;
+        this._placementCommitCount = 0;
+        this._placementSkipCount = 0;
 
         this._addKeybindings();
         this._connectSignals();
         this._trackExistingWindows();
-        this._retileActiveWorkspace();
+        this._retileActiveWorkspace(new Set(['enable']));
     }
 
     disable() {
@@ -121,29 +133,23 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         for (const sourceId of this._closingWindowSourceIds.values())
             GLib.source_remove(sourceId);
 
-        this._cancelQueuedRetile();
+        this._releaseTilingPresentation();
 
         this._signals = [];
         this._windowSignals.clear();
         this._pendingRetileSignals.clear();
         this._closingWindows.clear();
         this._closingWindowSourceIds.clear();
-        for (const window of [...this._stripAnimations.keys()])
-            this._stopStripAnimation(window, true);
-
-        for (const window of [...this._stripClips.keys()])
-            this._unclipStripWindow(window);
-
-        for (const window of [...this._parkedWindows])
-            this._unparkStripWindow(window);
-
         this._states.clear();
         this._workspaceModes.clear();
         this._stripClips.clear();
+        this._dirtyStripClips.clear();
         this._stripAnimations.clear();
         this._parkedWindows.clear();
         this._appliedRects.clear();
         this._correctionHistory.clear();
+        this._forcePlacementWindows.clear();
+        this._pendingRetileReasons.clear();
         this._grabbedWindow = null;
         this._inLayout = false;
         this._settings = null;
@@ -156,16 +162,22 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     _connectSignals() {
         this._connect(global.display, 'window-created', (_display, window) => {
             this._trackWindow(window);
-            this._queueRetileAfterWindowReady(window);
+            if (this._tilingEnabled())
+                this._queueRetileAfterWindowReady(window);
         });
         this._connect(global.display, 'notify::focus-window', () => {
             this._syncActiveWindowToFocus();
         });
         this._connect(global.display, 'workareas-changed', () => {
-            this._queueRetile();
+            const signature = this._workAreaSignature();
+            if (signature === this._lastWorkAreaSignature)
+                return;
+
+            this._lastWorkAreaSignature = signature;
+            this._queueRetile('workareas-changed', WORKAREA_SETTLE_MS);
         });
         this._connect(global.workspace_manager, 'active-workspace-changed', () => {
-            this._retileActiveWorkspace();
+            this._queueRetile('active-workspace-changed');
         });
         this._connect(global.workspace_manager, 'workspace-removed', () => {
             this._pruneStaleWorkspaces();
@@ -174,10 +186,10 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         // rearranged, so per-index layout state cannot be trusted across a
         // change; rebuild the trees from the windows present afterwards.
         this._connect(Main.layoutManager, 'monitors-changed', () => {
+            this._releaseTilingPresentation();
             this._states.clear();
-            this._appliedRects.clear();
-            this._correctionHistory.clear();
-            this._queueRetile();
+            this._lastWorkAreaSignature = this._workAreaSignature();
+            this._queueRetile('monitors-changed');
         });
         // User moves/resizes happen under a grab. A resize is folded back
         // into the split ratios so the layout keeps the user's chosen size;
@@ -192,12 +204,17 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             // In scrolling mode a drag-drop re-slots the window as its own
             // column at the nearest boundary (possibly on another monitor).
             if (op === Meta.GrabOp.MOVING && this._handleStripDrop(window)) {
-                this._queueRetile();
+                this._forcePlacementWindows.add(window);
+                this._queueRetile('grab-drop');
                 return;
             }
 
             this._applyGrabbedGeometry(window, op);
-            this._queueRetile();
+            // Position changes during the grab were intentionally ignored by
+            // drift detection. Force the grabbed window even when its logical
+            // target stayed unchanged (the ordinary BSP move/snap-back case).
+            this._forcePlacementWindows.add(window);
+            this._queueRetile('grab-end');
         });
         // Overview previews render through the live actors, so monitor clips
         // must lift while the overview is visible.
@@ -207,11 +224,17 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         });
         this._connect(Main.overview, 'hidden', () => {
             for (const window of this._stripClips.keys())
-                this._refreshStripClip(window);
+                this._queueStripClipRefresh(window);
         });
         this._connect(this._settings, 'changed', (_settings, key) => {
-            if (key === 'tiling-enabled' || key === 'gap-size')
-                this._retileActiveWorkspace();
+            if (key === 'tiling-enabled') {
+                if (this._tilingEnabled())
+                    this._queueRetile('tiling-enabled');
+                else
+                    this._releaseTilingPresentation();
+            } else if (key === 'gap-size') {
+                this._queueRetile('gap-size');
+            }
         });
     }
 
@@ -224,7 +247,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 // was left alone after fighting its tile; give those windows
                 // a fresh correction budget.
                 this._correctionHistory.clear();
-                this._retileActiveWorkspace();
+                this._retileActiveWorkspace(new Set(['manual-retile']));
             },
             'equalize-ratios': () => this._equalizeRatios(),
             'focus-column-left': () => this._focusNeighbor('x', -1),
@@ -378,33 +401,62 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._resetRatios(node.second);
     }
 
-    _queueRetile(delayMs = 0) {
-        // A delayed request (close settling) must not displace an immediate
-        // pass already scheduled for the next repaint — a burst of menu
-        // closes could otherwise postpone a real placement.
-        if (delayMs > 0 && this._retileLaterId)
+    _queueRetile(reason = 'unspecified', delayMs = 0) {
+        // Keep compatibility with the old private call shape while every
+        // internal caller migrates to reason-tagged requests.
+        if (typeof reason === 'number') {
+            delayMs = reason;
+            reason = 'unspecified';
+        }
+
+        this._pendingRetileReasons.add(reason);
+
+        // An immediate transaction already queued for this repaint subsumes
+        // delayed requests. Their reasons remain attached to that transaction.
+        if (this._retileLaterId)
             return;
 
-        this._cancelQueuedRetile();
-
         if (delayMs > 0) {
+            // Delayed requests use trailing debounce: a settling burst creates
+            // one transaction after the final notification.
+            if (this._retileSourceId)
+                GLib.source_remove(this._retileSourceId);
+
             this._retileSourceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delayMs, () => {
                 this._retileSourceId = 0;
-                if (this._settings)
-                    this._retileActiveWorkspace();
+                this._scheduleRetileBeforeRedraw();
                 return GLib.SOURCE_REMOVE;
             });
             return;
         }
 
+        if (this._retileSourceId) {
+            GLib.source_remove(this._retileSourceId);
+            this._retileSourceId = 0;
+        }
+
+        this._scheduleRetileBeforeRedraw();
+    }
+
+    _scheduleRetileBeforeRedraw() {
+        if (this._retileLaterId)
+            return;
+
         // Lay out right before the next repaint instead of from an idle
         // source, so windows never paint a frame in a pre-tile position.
         this._retileLaterId = global.compositor.get_laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
             this._retileLaterId = 0;
+            const reasons = this._consumeRetileReasons();
             if (this._settings)
-                this._retileActiveWorkspace();
+                this._retileActiveWorkspace(reasons);
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    _consumeRetileReasons() {
+        const reasons = this._pendingRetileReasons;
+        this._pendingRetileReasons = new Set();
+        return reasons;
     }
 
     _cancelQueuedRetile() {
@@ -417,6 +469,44 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             global.compositor.get_laters().remove(this._retileLaterId);
             this._retileLaterId = 0;
         }
+
+        this._pendingRetileReasons.clear();
+    }
+
+    _workAreaSignature(workspace = this._activeWorkspace()) {
+        if (!workspace)
+            return '';
+
+        const rects = [];
+        const monitorCount = global.display.get_n_monitors();
+        for (let monitor = 0; monitor < monitorCount; monitor++) {
+            try {
+                const rect = workspace.get_work_area_for_monitor(monitor);
+                rects.push(`${rect.x},${rect.y},${rect.width},${rect.height}`);
+            } catch (_error) {
+                rects.push('unavailable');
+            }
+        }
+
+        return rects.join('|');
+    }
+
+    _releaseTilingPresentation() {
+        this._cancelQueuedRetile();
+        this._cancelQueuedStripClipRefresh();
+
+        for (const window of [...this._stripAnimations.keys()])
+            this._stopStripAnimation(window, true);
+
+        for (const window of [...this._stripClips.keys()])
+            this._unclipStripWindow(window);
+
+        for (const window of [...this._parkedWindows])
+            this._unparkStripWindow(window);
+
+        this._appliedRects.clear();
+        this._correctionHistory.clear();
+        this._forcePlacementWindows.clear();
     }
 
     _tilingEnabled() {
@@ -449,15 +539,41 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         for (let index = 0; index < manager.get_n_workspaces(); index++)
             live.add(manager.get_workspace_by_index(index));
 
-        for (const workspace of [...this._states.keys()]) {
-            if (!live.has(workspace)) {
-                this._states.delete(workspace);
-                this._log('pruned layout state for a removed workspace');
+        const remembered = new Set([
+            ...this._states.keys(),
+            ...this._workspaceModes.keys(),
+        ]);
+
+        for (const workspace of remembered) {
+            if (live.has(workspace))
+                continue;
+
+            const perMonitor = this._states.get(workspace);
+            for (const state of perMonitor?.values() ?? []) {
+                const windows = new Set([
+                    ...this._leafWindows(state.root),
+                    ...this._stripWindows(state.strip),
+                ]);
+                for (const window of windows) {
+                    this._stopStripAnimation(window, true);
+                    this._unclipStripWindow(window);
+                    this._unparkStripWindow(window);
+                    this._appliedRects.delete(window);
+                    this._correctionHistory.delete(window);
+                    this._forcePlacementWindows.delete(window);
+                }
             }
+
+            this._states.delete(workspace);
+            this._workspaceModes.delete(workspace);
+            this._log('pruned layout state and presentation for a removed workspace');
         }
     }
 
     _syncActiveWindowToFocus() {
+        if (!this._tilingEnabled())
+            return;
+
         const window = global.display.focus_window;
 
         if (!window || !this._isTileable(window))
@@ -571,12 +687,28 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         // _onWindowGeometryChanged caps corrections per target rect so a
         // window that refuses its tile cannot ping-pong forever.
         const queueUnlessLayout = () => {
-            if (!this._inLayout)
+            if (!this._inLayout && this._tilingEnabled())
                 this._queueRetile();
+        };
+        const releaseAfterWorkspaceChange = () => {
+            if (this._inLayout)
+                return;
+
+            // A window leaving an active scrolling workspace must not carry a
+            // monitor clip, compositor translation, or parked visibility into
+            // its new workspace. Its new owner will establish fresh state.
+            this._stopStripAnimation(window, true);
+            this._unclipStripWindow(window);
+            this._unparkStripWindow(window);
+            this._appliedRects.delete(window);
+            this._correctionHistory.delete(window);
+            this._forcePlacementWindows.delete(window);
+            if (this._tilingEnabled())
+                this._queueRetile('window-workspace-changed');
         };
 
         const signalIds = [
-            window.connect('workspace-changed', queueUnlessLayout),
+            window.connect('workspace-changed', releaseAfterWorkspaceChange),
             window.connect('notify::minimized', queueUnlessLayout),
             window.connect('notify::fullscreen', queueUnlessLayout),
             window.connect('notify::maximized-horizontally', () => this._onWindowMaximizedChanged(window)),
@@ -590,6 +722,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 this._unclipStripWindow(window);
                 this._parkedWindows.delete(window);
                 this._correctionHistory.delete(window);
+                this._forcePlacementWindows.delete(window);
                 const wasPlaced = this._appliedRects.delete(window);
                 const wasInLayout = this._removeWindowFromStates(window);
 
@@ -706,11 +839,10 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     // old behavior (a maximized window floats above the tiles until
     // unmaximized, because it stops being resizable).
     _onWindowMaximizedChanged(window) {
-        if (this._inLayout || !this._settings)
+        if (this._inLayout || !this._settings || !this._tilingEnabled())
             return;
 
-        if (this._tilingEnabled() &&
-            (window.maximized_horizontally || window.maximized_vertically)) {
+        if (window.maximized_horizontally || window.maximized_vertically) {
             const workspace = window.get_workspace();
 
             if (workspace && this._workspaceMode(workspace) === 'scrolling' &&
@@ -740,7 +872,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             }
         }
 
-        this._queueRetile();
+        this._forcePlacementWindows.add(window);
+        this._queueRetile('maximized-changed');
     }
 
     // App-driven geometry changes (session restore, late self-resize) used to
@@ -761,9 +894,10 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (window.get_workspace() !== this._activeWorkspace())
             return;
 
-        // A pass is already scheduled and will re-place everything anyway;
-        // it must not eat into this window's correction budget.
-        if (this._retileLaterId || this._retileSourceId)
+        // Multiple geometry notifications for one drift must consume only one
+        // correction. A queued general transaction is not enough by itself:
+        // changed-only placement needs this explicit force marker.
+        if (this._forcePlacementWindows.has(window))
             return;
 
         let frame;
@@ -802,7 +936,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
         corrections.count++;
         this._log(`geometry drift on '${window.get_title() ?? '?'}'; re-asserting layout (${corrections.count}/${DRIFT_CORRECTION_LIMIT})`);
-        this._queueRetile();
+        this._forcePlacementWindows.add(window);
+        this._queueRetile('geometry-drift');
     }
 
     _queueRetileAfterWindowReady(window) {
@@ -873,7 +1008,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             GLib.source_remove(pending.timeoutId);
     }
 
-    _retileActiveWorkspace() {
+    _retileActiveWorkspace(reasons = new Set(['direct'])) {
         if (!this._tilingEnabled())
             return;
 
@@ -881,9 +1016,17 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         const mode = this._workspaceMode(workspace);
         const monitorCount = global.display.get_n_monitors();
         const gap = this._settings.get_int('gap-size');
+        const forceAll = reasons.has('manual-retile');
+        const stats = this._newPlacementStats();
+
+        this._retilePassCount++;
 
         if (mode === 'scrolling') {
-            this._retileStrips(workspace, monitorCount, gap);
+            this._mergePlacementStats(
+                stats,
+                this._retileStrips(workspace, monitorCount, gap, forceAll)
+            );
+            this._recordRetileStats(workspace, mode, reasons, stats);
             return;
         }
 
@@ -892,18 +1035,18 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             const state = this._stateFor(workspace, monitor);
             const workArea = workspace.get_work_area_for_monitor(monitor);
 
-            this._log(`retile ws=${workspace.index()} monitor=${monitor} mode=bsp tileable=${windows.length}`);
-
             this._syncWindows(state, windows, workArea, gap);
-            this._layout(workArea, gap, state);
+            this._mergePlacementStats(stats, this._layout(workArea, gap, state, forceAll));
         }
+
+        this._recordRetileStats(workspace, mode, reasons, stats);
     }
 
     // Strip membership must be sticky: a scrolled-out column sits at
     // coordinates that spatially belong to a neighboring monitor, so
     // get_monitor() cannot be trusted for windows a strip already owns.
     // Only windows no strip has claimed are assigned by monitor.
-    _retileStrips(workspace, monitorCount, gap) {
+    _retileStrips(workspace, monitorCount, gap, forceAll = false) {
         const workspaceWindows = global.display
             .get_tab_list(Meta.TabList.NORMAL_ALL, workspace)
             .filter(window => !this._closingWindows.has(window))
@@ -927,14 +1070,16 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         }
 
         const placed = new Set();
+        const stats = this._newPlacementStats();
         for (let monitor = 0; monitor < monitorCount; monitor++) {
             const state = this._stateFor(workspace, monitor);
             const workArea = workspace.get_work_area_for_monitor(monitor);
 
-            this._log(`retile ws=${workspace.index()} monitor=${monitor} mode=scrolling tileable=${perMonitor[monitor].length}`);
-
             this._syncStrip(state, perMonitor[monitor]);
-            this._layoutStrip(state, workArea, gap, monitor);
+            this._mergePlacementStats(
+                stats,
+                this._layoutStrip(state, workArea, gap, monitor, forceAll)
+            );
 
             for (const window of this._stripWindows(state.strip))
                 placed.add(window);
@@ -951,6 +1096,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             if (!placed.has(window) && window.get_workspace() === workspace)
                 this._unparkStripWindow(window);
         }
+
+        return stats;
     }
 
     _syncWindows(state, windows, workArea, gap) {
@@ -968,17 +1115,18 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             state.activeWindow = this._lastWindow(state.root);
     }
 
-    _layout(workArea, gap, state) {
+    _layout(workArea, gap, state, forceAll = false) {
         if (!state.root)
-            return;
+            return this._newPlacementStats();
 
         const placements = this._layoutRects(state.root, this._insetRect(workArea, gap), gap);
-        this._applyPlacements(placements, workArea, false);
+        return this._applyPlacements(placements, workArea, false, forceAll);
     }
 
-    _applyPlacements(placements, workArea, stripPlacement) {
+    _applyPlacements(placements, workArea, stripPlacement, forceAll = false) {
         // Mark our own placement pass so the geometry signals it provokes do not
         // bounce back in as fresh retile requests.
+        const stats = this._newPlacementStats();
         this._inLayout = true;
         try {
             for (const {window, rect} of placements) {
@@ -999,33 +1147,85 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 if (safeRect.clamped)
                     this._log(`tile below minimum size; clamped to ${safeRect.width}x${safeRect.height}`);
 
+                const target = {
+                    x: safeRect.x,
+                    y: safeRect.y,
+                    width: safeRect.width,
+                    height: safeRect.height,
+                };
+                const previous = this._appliedRects.get(window);
+                const targetChanged = !this._rectsEqual(previous, target);
+                const forced = forceAll || this._forcePlacementWindows.has(window);
+
+                if (!targetChanged && !forced) {
+                    stats.skipped++;
+                    continue;
+                }
+
                 // Tiled windows must not stay maximized or they cover the rest of
                 // the layout; drop maximization before applying the tile rect.
                 // (Mutter 50 dropped the flags argument: unmaximize() is total.)
                 if (window.maximized_horizontally || window.maximized_vertically)
                     window.unmaximize();
 
-                this._appliedRects.set(window, {
-                    x: safeRect.x,
-                    y: safeRect.y,
-                    width: safeRect.width,
-                    height: safeRect.height,
-                });
-
                 // Strip placement must be a user op: Mutter forces non-user
                 // placements fully on-screen, which would fold the whole
                 // strip onto the monitor.
-                window.move_resize_frame(
-                    stripPlacement,
-                    safeRect.x,
-                    safeRect.y,
-                    safeRect.width,
-                    safeRect.height
-                );
+                try {
+                    window.move_resize_frame(
+                        stripPlacement,
+                        target.x,
+                        target.y,
+                        target.width,
+                        target.height
+                    );
+                } catch (error) {
+                    console.warn(`[ohno-scroller] placement failed: ${error.message}`);
+                    continue;
+                }
+
+                this._appliedRects.set(window, target);
+                this._forcePlacementWindows.delete(window);
+                if (targetChanged)
+                    this._correctionHistory.delete(window);
+                stats.committed++;
+                stats.committedWindows.add(window);
             }
         } finally {
             this._inLayout = false;
         }
+
+        return stats;
+    }
+
+    _rectsEqual(first, second) {
+        return Boolean(first && second &&
+            first.x === second.x &&
+            first.y === second.y &&
+            first.width === second.width &&
+            first.height === second.height);
+    }
+
+    _newPlacementStats() {
+        return {committed: 0, skipped: 0, committedWindows: new Set()};
+    }
+
+    _mergePlacementStats(target, source) {
+        if (!source)
+            return target;
+
+        target.committed += source.committed;
+        target.skipped += source.skipped;
+        for (const window of source.committedWindows)
+            target.committedWindows.add(window);
+        return target;
+    }
+
+    _recordRetileStats(workspace, mode, reasons, stats) {
+        this._placementCommitCount += stats.committed;
+        this._placementSkipCount += stats.skipped;
+        const reasonText = [...reasons].sort().join(',') || 'unspecified';
+        this._log(`retile #${this._retilePassCount} ws=${workspace.index()} mode=${mode} reasons=${reasonText} committed=${stats.committed} unchanged=${stats.skipped}`);
     }
 
     // The strip variant of _safeRect: vertical bounds and sizes clamp to the
@@ -1345,14 +1545,18 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         return {type: 'split', axis, ratio: 0.5, first, second};
     }
 
-    _leafWindows(node) {
+    _leafWindows(node, windows = []) {
         if (!node)
-            return [];
+            return windows;
 
-        if (node.type === 'leaf')
-            return [node.window];
+        if (node.type === 'leaf') {
+            windows.push(node.window);
+            return windows;
+        }
 
-        return [...this._leafWindows(node.first), ...this._leafWindows(node.second)];
+        this._leafWindows(node.first, windows);
+        this._leafWindows(node.second, windows);
+        return windows;
     }
 
     _lastWindow(node) {
@@ -1577,10 +1781,10 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         state.activeWindow = this._stripFocusedWindow(strip);
     }
 
-    _layoutStrip(state, workArea, gap, monitor) {
+    _layoutStrip(state, workArea, gap, monitor, forceAll = false) {
         const strip = state.strip;
         if (!strip || strip.columns.length === 0)
-            return;
+            return this._newPlacementStats();
 
         const inner = this._insetRect(workArea, gap);
         const widths = strip.columns.map(column =>
@@ -1631,7 +1835,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             }
         }
 
-        this._applyPlacements(placements, workArea, true);
+        const stats = this._applyPlacements(placements, workArea, true, forceAll);
 
         for (const {window, parked} of placements) {
             if (parked) {
@@ -1642,10 +1846,12 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
                 const applied = this._appliedRects.get(window);
                 const from = fromVisual.get(window);
-                if (applied && from !== undefined)
+                if (stats.committedWindows.has(window) && applied && from !== undefined)
                     this._animateStripWindow(window, from, applied.x);
             }
         }
+
+        return stats;
     }
 
     _animationsEnabled() {
@@ -1876,18 +2082,49 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             entry = {
                 actor,
                 monitor,
-                xId: actor.connect('notify::x', () => this._refreshStripClip(window)),
-                yId: actor.connect('notify::y', () => this._refreshStripClip(window)),
+                xId: actor.connect('notify::x', () => this._queueStripClipRefresh(window)),
+                yId: actor.connect('notify::y', () => this._queueStripClipRefresh(window)),
                 // The scroll animation moves the actor by translation, so the
-                // clip must re-anchor every animation frame too.
-                translationId: actor.connect('notify::translation-x', () => this._refreshStripClip(window)),
-                destroyId: actor.connect('destroy', () => this._stripClips.delete(window)),
+                // clip must re-anchor during animation too. Property changes
+                // are batched into one clip update per compositor frame.
+                translationId: actor.connect('notify::translation-x', () => this._queueStripClipRefresh(window)),
+                destroyId: actor.connect('destroy', () => {
+                    this._stripClips.delete(window);
+                    this._dirtyStripClips.delete(window);
+                }),
             };
             this._stripClips.set(window, entry);
         }
 
         entry.monitor = monitor;
-        this._refreshStripClip(window);
+        this._queueStripClipRefresh(window);
+    }
+
+    _queueStripClipRefresh(window) {
+        if (!this._stripClips.has(window))
+            return;
+
+        this._dirtyStripClips.add(window);
+        if (this._stripClipLaterId)
+            return;
+
+        this._stripClipLaterId = global.compositor.get_laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
+            this._stripClipLaterId = 0;
+            const dirty = this._dirtyStripClips;
+            this._dirtyStripClips = new Set();
+            for (const dirtyWindow of dirty)
+                this._refreshStripClip(dirtyWindow);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _cancelQueuedStripClipRefresh() {
+        if (this._stripClipLaterId) {
+            global.compositor.get_laters().remove(this._stripClipLaterId);
+            this._stripClipLaterId = 0;
+        }
+
+        this._dirtyStripClips.clear();
     }
 
     _refreshStripClip(window) {
@@ -1918,6 +2155,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             return;
 
         this._stripClips.delete(window);
+        this._dirtyStripClips.delete(window);
 
         try {
             entry.actor.disconnect(entry.xId);
@@ -1930,19 +2168,19 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         }
     }
 
-    _layoutRects(node, rect, gap) {
+    _layoutRects(node, rect, gap, placements = []) {
         if (!node)
-            return [];
+            return placements;
 
-        if (node.type === 'leaf')
-            return [{window: node.window, rect}];
+        if (node.type === 'leaf') {
+            placements.push({window: node.window, rect});
+            return placements;
+        }
 
         const [firstRect, secondRect] = this._splitRect(rect, node.axis, node.ratio, gap);
-
-        return [
-            ...this._layoutRects(node.first, firstRect, gap),
-            ...this._layoutRects(node.second, secondRect, gap),
-        ];
+        this._layoutRects(node.first, firstRect, gap, placements);
+        this._layoutRects(node.second, secondRect, gap, placements);
+        return placements;
     }
 
     _splitRect(rect, axis, ratio, gap) {

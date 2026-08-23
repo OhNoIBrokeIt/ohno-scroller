@@ -6,5 +6,5 @@
   "session-modes": ["user", "unlock-dialog"],
   "settings-schema": "dev.ohnoibrokeit.gnome-shell.extensions.ohno-scroller",
   "url": "https://github.com/OhNoIBrokeIt/ohno-scroller",
-  "version": 6
+  "version": 7
 }
