@@ -32,6 +32,61 @@
       <summary>Enable debug logging</summary>
       <description>Log retile activity, suppressed retiles, skipped placements, and crowded tiles to the journal for troubleshooting.</description>
     </key>
+    <key name="scrolling-focus-mode" type="s">
+      <choices><choice value="fit"/><choice value="center"/></choices>
+      <default>'fit'</default>
+      <summary>How scrolling columns follow focus</summary>
+      <description>Fit scrolls only enough to reveal the focused column; center always centers it.</description>
+    </key>
+    <key name="single-column-full-width" type="b">
+      <default>true</default>
+      <summary>Expand a lone scrolling column</summary>
+      <description>Use the full work area when only one column remains, preserving its chosen width for when another column opens.</description>
+    </key>
+    <key name="wrap-focus" type="b">
+      <default>true</default>
+      <summary>Wrap horizontal scrolling focus</summary>
+      <description>Continue at the opposite end of the strip when no adjacent monitor can receive focus.</description>
+    </key>
+    <key name="wrap-column-movement" type="b">
+      <default>true</default>
+      <summary>Wrap scrolling column movement</summary>
+    </key>
+    <key name="resize-step" type="i">
+      <default>40</default>
+      <range min="5" max="200"/>
+      <summary>Keyboard resize step in pixels</summary>
+    </key>
+    <key name="animation-duration" type="i">
+      <default>220</default>
+      <range min="0" max="1000"/>
+      <summary>Layout movement animation duration in milliseconds</summary>
+      <description>Animate horizontal and vertical moves in both layouts. Zero disables movement animations; the system animation setting is also respected.</description>
+    </key>
+    <key name="toggle-floating" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;v']</default>
+      <summary>Toggle the focused window between tiled and floating</summary>
+    </key>
+    <key name="toggle-split" type="as">
+      <default>['&lt;Super&gt;w']</default>
+      <summary>Toggle the focused split between horizontal and vertical (BSP)</summary>
+    </key>
+    <key name="resize-width-decrease" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;h']</default>
+      <summary>Decrease the focused tile or column width</summary>
+    </key>
+    <key name="resize-width-increase" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;l']</default>
+      <summary>Increase the focused tile or column width</summary>
+    </key>
+    <key name="resize-height-decrease" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;k']</default>
+      <summary>Decrease the focused tile height</summary>
+    </key>
+    <key name="resize-height-increase" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;j']</default>
+      <summary>Increase the focused tile height</summary>
+    </key>
     <key name="toggle-tiling" type="as">
       <default>['&lt;Super&gt;y']</default>
       <summary>Toggle tiling</summary>

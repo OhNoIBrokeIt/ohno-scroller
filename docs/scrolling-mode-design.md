@@ -2,6 +2,13 @@
 
 Status: implemented; original design agreed 2026-07-04.
 
+This document records the original v6 design. Version 8 (2026-09-07) changes
+the viewport default to fit-to-view, expands lone columns without changing
+their saved width, adds configurable horizontal wrapping and floating, and
+animates movement on both axes in both layouts. Centering remains optional.
+The current behavior and shortcuts are documented in `../README.md`; the
+review findings and remaining parity gaps are in `hyprland-review.md`.
+
 ## Decisions
 
 | Axis | Decision |

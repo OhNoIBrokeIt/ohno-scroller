@@ -1,10 +1,10 @@
 {
   "uuid": "ohno-scroller@ohnoibrokeit.dev",
   "name": "Oh No Scroller",
-  "description": "Experimental GNOME tiler: bounded dwindle-style splits or niri-style scrolling columns, per workspace.",
+  "description": "Hyprland-inspired GNOME tiling: dwindle-style splits or scrolling columns, floating toggle, keyboard resizing, and animated movement.",
   "shell-version": ["50"],
   "session-modes": ["user", "unlock-dialog"],
   "settings-schema": "dev.ohnoibrokeit.gnome-shell.extensions.ohno-scroller",
   "url": "https://github.com/OhNoIBrokeIt/ohno-scroller",
-  "version": 7
+  "version": 9
 }

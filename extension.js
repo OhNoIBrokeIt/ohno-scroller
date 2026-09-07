@@ -24,6 +24,12 @@ const KEYBINDINGS = [
     'stack-window-left',
     'stack-window-right',
     'cycle-column-width',
+    'toggle-floating',
+    'toggle-split',
+    'resize-width-decrease',
+    'resize-width-increase',
+    'resize-height-decrease',
+    'resize-height-increase',
 ];
 
 const LAYOUT_MODES = new Set(['bsp', 'scrolling']);
@@ -57,8 +63,6 @@ const COLUMN_WIDTH_MAX = 1.0;
 // Width presets the cycle keybinding steps a scrolling column through; from
 // a drag-adjusted width the cycle resumes at the next-larger preset.
 const COLUMN_WIDTH_PRESETS = [1 / 3, 0.5, 2 / 3, 1.0];
-// How long a scroll eases actors to their new positions.
-const SCROLL_ANIMATION_MS = 220;
 // Work-area notifications arrive in short bursts while panels and monitors
 // settle. Wait for the final geometry instead of rebuilding the same layout
 // once per intermediate notification.
@@ -100,6 +104,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._appliedRects = new Map();
         this._correctionHistory = new Map();
         this._forcePlacementWindows = new Set();
+        this._floatingWindows = new Set();
+        this._floatingRects = new Map();
         this._grabbedWindow = null;
         this._inLayout = false;
         this._retileSourceId = 0;
@@ -149,6 +155,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._appliedRects.clear();
         this._correctionHistory.clear();
         this._forcePlacementWindows.clear();
+        this._floatingWindows.clear();
+        this._floatingRects.clear();
         this._pendingRetileReasons.clear();
         this._grabbedWindow = null;
         this._inLayout = false;
@@ -197,6 +205,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         // window is tracked so drift correction never fights a live drag.
         this._connect(global.display, 'grab-op-begin', (_display, window, _op) => {
             this._grabbedWindow = window;
+            if (window)
+                this._stopStripAnimation(window, true);
         });
         this._connect(global.display, 'grab-op-end', (_display, window, op) => {
             this._grabbedWindow = null;
@@ -219,6 +229,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         // Overview previews render through the live actors, so monitor clips
         // must lift while the overview is visible.
         this._connect(Main.overview, 'showing', () => {
+            for (const window of [...this._stripAnimations.keys()])
+                this._stopStripAnimation(window, true);
             for (const {actor} of this._stripClips.values())
                 actor.remove_clip();
         });
@@ -226,14 +238,23 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             for (const window of this._stripClips.keys())
                 this._queueStripClipRefresh(window);
         });
+        this._connect(St.Settings.get(), 'notify::enable-animations', () => {
+            if (!this._animationsEnabled()) {
+                for (const window of [...this._stripAnimations.keys()])
+                    this._stopStripAnimation(window, true);
+            }
+        });
         this._connect(this._settings, 'changed', (_settings, key) => {
             if (key === 'tiling-enabled') {
                 if (this._tilingEnabled())
                     this._queueRetile('tiling-enabled');
                 else
                     this._releaseTilingPresentation();
-            } else if (key === 'gap-size') {
-                this._queueRetile('gap-size');
+            } else if (['gap-size', 'scrolling-focus-mode', 'single-column-full-width'].includes(key)) {
+                this._queueRetile(key);
+            } else if (key === 'animation-duration' && !this._animationsEnabled()) {
+                for (const window of [...this._stripAnimations.keys()])
+                    this._stopStripAnimation(window, true);
             }
         });
     }
@@ -262,12 +283,18 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             'stack-window-left': () => this._stackFocusedWindow(-1),
             'stack-window-right': () => this._stackFocusedWindow(1),
             'cycle-column-width': () => this._cycleColumnWidth(),
+            'toggle-floating': () => this._toggleFloating(),
+            'toggle-split': () => this._toggleSplit(),
+            'resize-width-decrease': () => this._resizeFocusedWindow('x', -1),
+            'resize-width-increase': () => this._resizeFocusedWindow('x', 1),
+            'resize-height-decrease': () => this._resizeFocusedWindow('y', -1),
+            'resize-height-increase': () => this._resizeFocusedWindow('y', 1),
         };
 
         for (const name of KEYBINDINGS) {
-            // Focus bindings may repeat while held; everything else acts once
+            // Focus and resize may repeat while held; everything else acts once
             // per press so a held key cannot churn the tree.
-            const flags = name.startsWith('focus-')
+            const flags = name.startsWith('focus-') || name.startsWith('resize-')
                 ? Meta.KeyBindingFlags.NONE
                 : Meta.KeyBindingFlags.IGNORE_AUTOREPEAT;
 
@@ -286,6 +313,102 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
     _toggleTiling() {
         this._settings.set_boolean('tiling-enabled', !this._settings.get_boolean('tiling-enabled'));
+    }
+
+    _toggleFloating() {
+        const window = global.display.focus_window;
+        if (!this._tilingEnabled() || this._grabbedWindow || !window || window.is_fullscreen())
+            return;
+
+        if (this._floatingWindows.has(window)) {
+            if (window.maximized_horizontally || window.maximized_vertically)
+                window.unmaximize();
+            else
+                this._floatingRects.set(window, this._copyRect(window.get_frame_rect()));
+            this._floatingWindows.delete(window);
+            this._queueRetile('toggle-floating');
+            return;
+        }
+
+        if (!this._canPlace(window))
+            return;
+
+        this._floatingWindows.add(window);
+        this._removeWindowFromStates(window);
+        this._stopStripAnimation(window, true);
+        this._unclipStripWindow(window);
+        this._unparkStripWindow(window);
+        this._appliedRects.delete(window);
+        this._correctionHistory.delete(window);
+        this._forcePlacementWindows.delete(window);
+
+        const area = window.get_workspace().get_work_area_for_monitor(window.get_monitor());
+        const remembered = this._floatingRects.get(window);
+        const rect = this._safeRect(remembered ?? {
+            x: area.x + area.width * 0.1,
+            y: area.y + area.height * 0.1,
+            width: area.width * 0.8,
+            height: area.height * 0.8,
+        }, area);
+        if (rect)
+            window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
+        window.raise();
+        this._queueRetile('toggle-floating');
+    }
+
+    _toggleSplit() {
+        const window = global.display.focus_window;
+        if (!this._tilingEnabled() || this._grabbedWindow || !this._canPlace(window))
+            return;
+
+        const workspace = window.get_workspace();
+        if (this._workspaceMode(workspace) !== 'bsp')
+            return;
+
+        const state = this._stateFor(workspace, window.get_monitor());
+        const parent = this._pathToLeaf(state.root, window)?.at(-1)?.split;
+        if (!parent)
+            return;
+
+        parent.axis = parent.axis === 'x' ? 'y' : 'x';
+        this._queueRetile('toggle-split');
+    }
+
+    // Change the focused tile's size, choosing its nearest divider on the
+    // requested axis. A tile on the second side grows by moving that divider
+    // backwards. Reuse the pointer-resize folding rules in both layouts.
+    _resizeFocusedWindow(axis, direction) {
+        const window = global.display.focus_window;
+        if (!this._tilingEnabled() || this._grabbedWindow || !this._canPlace(window))
+            return;
+
+        const workspace = window.get_workspace();
+        const delta = direction * this._settings.get_int('resize-step');
+        const gap = this._settings.get_int('gap-size');
+        if (this._workspaceMode(workspace) === 'scrolling') {
+            const located = this._locateInStrips(workspace, window);
+            const applied = this._appliedRects.get(window);
+            if (!located || !applied)
+                return;
+
+            const column = located.state.strip.columns[located.at.column];
+            const edges = axis === 'x' ? {right: true}
+                : located.at.index < column.windows.length - 1 ? {bottom: true} : {top: true};
+            const frame = {...applied};
+            frame[axis === 'x' ? 'width' : 'height'] += delta;
+            this._foldStripResize(window, workspace, edges, applied, frame);
+        } else {
+            const monitor = window.get_monitor();
+            const state = this._stateFor(workspace, monitor);
+            const path = this._pathToLeaf(state.root, window);
+            const divider = path?.findLast(item => item.split.axis === axis);
+            if (!divider)
+                return;
+
+            this._resizeDivider(workspace.get_work_area_for_monitor(monitor), gap,
+                path, axis, divider.childKey, divider.childKey === 'first' ? delta : -delta);
+        }
+        this._queueRetile('keyboard-resize');
     }
 
     // A workspace's layout mode is decided lazily from the default and then
@@ -517,6 +640,12 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         return global.workspace_manager.get_active_workspace();
     }
 
+    _monitorHasFullscreen(workspace, monitor) {
+        return global.display.get_tab_list(Meta.TabList.NORMAL_ALL, workspace)
+            .some(window => !window.minimized && !this._closingWindows.has(window) &&
+                window.get_monitor() === monitor && window.is_fullscreen());
+    }
+
     _stateFor(workspace, monitor) {
         // Key by the workspace object, not workspace.index(): GNOME's dynamic
         // workspaces renumber on removal, so an index key would silently rebind
@@ -594,7 +723,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 column.focusIndex = at.index;
                 state.activeWindow = window;
 
-                // The focused column must always be centered; any focus that
+                // The focused column must be visible; any focus that
                 // arrives from outside our own handlers (click, alt-tab,
                 // overview) scrolls the strip.
                 if (moved && workspace === this._activeWorkspace())
@@ -648,7 +777,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     }
 
     _isTileable(window) {
-        if (!window || window.minimized)
+        if (!window || window.minimized || this._floatingWindows.has(window))
             return false;
 
         if (!window.get_workspace())
@@ -710,7 +839,15 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         const signalIds = [
             window.connect('workspace-changed', releaseAfterWorkspaceChange),
             window.connect('notify::minimized', queueUnlessLayout),
-            window.connect('notify::fullscreen', queueUnlessLayout),
+            window.connect('notify::fullscreen', () => {
+                // Fullscreen is an overlay: release the strip's presentation
+                // immediately, retaining membership while its monitor pauses.
+                this._stopStripAnimation(window, true);
+                this._unclipStripWindow(window);
+                this._unparkStripWindow(window);
+                this._forcePlacementWindows.add(window);
+                queueUnlessLayout();
+            }),
             window.connect('notify::maximized-horizontally', () => this._onWindowMaximizedChanged(window)),
             window.connect('notify::maximized-vertically', () => this._onWindowMaximizedChanged(window)),
             window.connect('size-changed', () => this._onWindowGeometryChanged(window)),
@@ -723,6 +860,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 this._parkedWindows.delete(window);
                 this._correctionHistory.delete(window);
                 this._forcePlacementWindows.delete(window);
+                this._floatingWindows.delete(window);
+                this._floatingRects.delete(window);
                 const wasPlaced = this._appliedRects.delete(window);
                 const wasInLayout = this._removeWindowFromStates(window);
 
@@ -812,11 +951,15 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (!at)
             return;
 
-        const wasFocused = this._stripFocusedWindow(strip) === window;
+        const focusedBefore = this._stripFocusedWindow(strip);
+        const wasFocused = focusedBefore === window;
         const column = strip.columns[at.column];
+        const columnFocus = column.windows[column.focusIndex];
         column.windows.splice(at.index, 1);
         column.heightWeights.splice(at.index, 1);
-        column.focusIndex = Math.max(0, Math.min(column.focusIndex, column.windows.length - 1));
+        column.focusIndex = column.windows.includes(columnFocus)
+            ? column.windows.indexOf(columnFocus)
+            : Math.max(0, Math.min(at.index, column.windows.length - 1));
 
         if (column.windows.length === 0) {
             strip.columns.splice(at.column, 1);
@@ -827,6 +970,10 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         strip.focusColumn = Math.max(0, Math.min(strip.focusColumn, strip.columns.length - 1));
         if (strip.columns.length === 0)
             strip.focusColumn = -1;
+
+        const survivingFocus = this._findInStrip(strip, focusedBefore);
+        if (survivingFocus)
+            strip.focusColumn = survivingFocus.column;
 
         state.activeWindow = this._stripFocusedWindow(strip);
     }
@@ -839,7 +986,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     // old behavior (a maximized window floats above the tiles until
     // unmaximized, because it stops being resizable).
     _onWindowMaximizedChanged(window) {
-        if (this._inLayout || !this._settings || !this._tilingEnabled())
+        if (this._inLayout || !this._settings || !this._tilingEnabled() || this._floatingWindows.has(window))
             return;
 
         if (window.maximized_horizontally || window.maximized_vertically) {
@@ -884,7 +1031,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (this._inLayout || !this._settings || !this._tilingEnabled())
             return;
 
-        if (this._grabbedWindow === window)
+        if (this._grabbedWindow === window || this._stripAnimations.has(window))
             return;
 
         const applied = this._appliedRects.get(window);
@@ -1012,6 +1159,12 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (!this._tilingEnabled())
             return;
 
+        if (this._grabbedWindow) {
+            for (const reason of reasons)
+                this._pendingRetileReasons.add(reason);
+            return; // grab-op-end schedules the deferred transaction
+        }
+
         const workspace = this._activeWorkspace();
         const mode = this._workspaceMode(workspace);
         const monitorCount = global.display.get_n_monitors();
@@ -1031,6 +1184,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         }
 
         for (let monitor = 0; monitor < monitorCount; monitor++) {
+            if (this._monitorHasFullscreen(workspace, monitor))
+                continue;
             const windows = this._tileableWindows(workspace, monitor);
             const state = this._stateFor(workspace, monitor);
             const workArea = workspace.get_work_area_for_monitor(monitor);
@@ -1075,11 +1230,13 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             const state = this._stateFor(workspace, monitor);
             const workArea = workspace.get_work_area_for_monitor(monitor);
 
-            this._syncStrip(state, perMonitor[monitor]);
-            this._mergePlacementStats(
-                stats,
-                this._layoutStrip(state, workArea, gap, monitor, forceAll)
-            );
+            if (!this._monitorHasFullscreen(workspace, monitor)) {
+                this._syncStrip(state, perMonitor[monitor]);
+                this._mergePlacementStats(
+                    stats,
+                    this._layoutStrip(state, workArea, gap, monitor, forceAll)
+                );
+            }
 
             for (const window of this._stripWindows(state.strip))
                 placed.add(window);
@@ -1113,10 +1270,16 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
         if (!this._containsWindow(state.root, state.activeWindow))
             state.activeWindow = this._lastWindow(state.root);
+        if (this._containsWindow(state.root, global.display.focus_window))
+            state.activeWindow = global.display.focus_window;
     }
 
     _layout(workArea, gap, state, forceAll = false) {
         if (!state.root)
+            return this._newPlacementStats();
+
+        const window = this._lastWindow(state.root);
+        if (this._monitorHasFullscreen(window.get_workspace(), window.get_monitor()))
             return this._newPlacementStats();
 
         const placements = this._layoutRects(state.root, this._insetRect(workArea, gap), gap);
@@ -1127,6 +1290,31 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         // Mark our own placement pass so the geometry signals it provokes do not
         // bounce back in as fresh retile requests.
         const stats = this._newPlacementStats();
+        if (this._grabbedWindow)
+            return stats;
+
+        // Capture both coordinates before any geometry commits. Actor/buffer
+        // bounds include client shadows; frame bounds do not. Preserve that
+        // offset instead of comparing an actor to a frame-space destination.
+        // This also lets a transaction continue an unfinished animation.
+        const fromVisual = new Map();
+        if (this._animationsEnabled()) {
+            for (const {window, parked} of placements) {
+                const actor = window.get_compositor_private?.();
+                if (actor && !parked && this._appliedRects.has(window)) {
+                    const frame = window.get_frame_rect();
+                    const buffer = window.get_buffer_rect();
+                    fromVisual.set(window, {
+                        x: actor.x + actor.translation_x,
+                        y: actor.y + actor.translation_y,
+                        actorX: actor.x,
+                        actorY: actor.y,
+                        bufferOffsetX: buffer.x - frame.x,
+                        bufferOffsetY: buffer.y - frame.y,
+                    });
+                }
+            }
+        }
         this._inLayout = true;
         try {
             for (const {window, rect} of placements) {
@@ -1154,6 +1342,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                     height: safeRect.height,
                 };
                 const previous = this._appliedRects.get(window);
+                if (!this._floatingRects.has(window))
+                    this._floatingRects.set(window, this._copyRect(window.get_frame_rect()));
                 const targetChanged = !this._rectsEqual(previous, target);
                 const forced = forceAll || this._forcePlacementWindows.has(window);
 
@@ -1195,7 +1385,26 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             this._inLayout = false;
         }
 
+        for (const window of stats.committedWindows) {
+            const from = fromVisual.get(window);
+            if (from) {
+                const target = this._appliedRects.get(window);
+                this._animateWindow(window, from, {
+                    x: target.x + from.bufferOffsetX,
+                    y: target.y + from.bufferOffsetY,
+                });
+            } else {
+                this._stopStripAnimation(window, true);
+            }
+        }
+
         return stats;
+    }
+
+    _copyRect(rect) {
+        // GI boxed rectangle fields live on the prototype; object spread
+        // would silently save an empty object.
+        return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
     }
 
     _rectsEqual(first, second) {
@@ -1265,10 +1474,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         return {x, y, width, height, clamped};
     }
 
-    // Pick the tile nearest to `window` whose center lies in `direction`
-    // (-1 left/up, +1 right/down) along `axis`. Distance along the axis
-    // dominates; the cross-axis distance breaks ties so stacked tiles
-    // resolve to the row/column the window actually sits in.
+    // Prefer a tile sharing the requested edge. Comparing centers alone
+    // allows a tall tile beside a stack to steal up/down navigation.
     _spatialNeighbor(state, workspace, monitor, window, axis, direction) {
         const workArea = workspace.get_work_area_for_monitor(monitor);
         const gap = this._settings.get_int('gap-size');
@@ -1278,29 +1485,32 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (!current)
             return null;
 
-        const currentCenter = this._rectCenter(current.rect);
+        return this._directionalCandidate(current.rect, rects.filter(item => item.window !== window),
+            axis, direction)?.window ?? null;
+    }
+
+    _directionalCandidate(current, candidates, axis, direction) {
+        const main = axis === 'x' ? 'x' : 'y';
+        const cross = axis === 'x' ? 'y' : 'x';
+        const size = axis === 'x' ? 'width' : 'height';
+        const crossSize = axis === 'x' ? 'height' : 'width';
         let best = null;
-        let bestDistance = Infinity;
-
-        for (const {window: candidate, rect} of rects) {
-            if (candidate === window)
+        let bestScore = null;
+        for (const candidate of candidates) {
+            const {rect} = candidate;
+            const distance = direction > 0
+                ? rect[main] - (current[main] + current[size])
+                : current[main] - (rect[main] + rect[size]);
+            if (distance < -1)
                 continue;
 
-            const center = this._rectCenter(rect);
-            const primary = axis === 'x'
-                ? center.x - currentCenter.x
-                : center.y - currentCenter.y;
-            const secondary = axis === 'x'
-                ? Math.abs(center.y - currentCenter.y)
-                : Math.abs(center.x - currentCenter.x);
-
-            if (direction < 0 ? primary >= 0 : primary <= 0)
-                continue;
-
-            const distance = Math.abs(primary) * 4 + secondary;
-
-            if (distance < bestDistance) {
-                bestDistance = distance;
+            const overlap = Math.min(current[cross] + current[crossSize], rect[cross] + rect[crossSize]) -
+                Math.max(current[cross], rect[cross]);
+            const score = [overlap > 0 ? 0 : 1, Math.max(0, distance),
+                Math.abs(rect[cross] + rect[crossSize] / 2 - current[cross] - current[crossSize] / 2)];
+            const differing = bestScore ? score.findIndex((value, index) => value !== bestScore[index]) : -1;
+            if (!bestScore || (differing >= 0 && score[differing] < bestScore[differing])) {
+                bestScore = score;
                 best = candidate;
             }
         }
@@ -1308,8 +1518,36 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         return best;
     }
 
-    _rectCenter(rect) {
-        return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
+    _focusAcrossMonitor(workspace, monitor, axis, direction) {
+        const monitors = Main.layoutManager.monitors;
+        const current = monitors[monitor];
+        if (!current)
+            return false;
+
+        const candidates = monitors.map((rect, index) => ({rect, index}))
+            .filter(item => item.index !== monitor);
+        const targetMonitor = this._directionalCandidate(current, candidates, axis, direction)?.index;
+        if (targetMonitor === undefined)
+            return false;
+
+        const state = this._stateFor(workspace, targetMonitor);
+        const windows = global.display.get_tab_list(Meta.TabList.NORMAL_ALL, workspace)
+            .filter(window => !window.minimized && !this._closingWindows.has(window) &&
+                window.get_monitor() === targetMonitor);
+        const fullscreen = windows.find(window => window.is_fullscreen());
+        const remembered = state.activeWindow;
+        const target = fullscreen ?? (remembered?.get_workspace() === workspace &&
+            this._canPlace(remembered) ? remembered : null) ??
+            windows.find(window => this._canPlace(window));
+        if (!target)
+            return false;
+
+        if (!fullscreen && this._workspaceMode(workspace) === 'scrolling' &&
+            this._findInStrip(state.strip, target))
+            this._focusStripWindow(state, target);
+        else
+            target.activate(global.get_current_time());
+        return true;
     }
 
     _focusNeighbor(axis, direction) {
@@ -1330,6 +1568,14 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             const target = this._stripNeighbor(located.state.strip, located.at, axis, direction);
             if (target)
                 this._focusStripWindow(located.state, target);
+            else if (!this._focusAcrossMonitor(workspace, located.monitor, axis, direction) &&
+                axis === 'x' && this._settings.get_boolean('wrap-focus')) {
+                const columns = located.state.strip.columns;
+                const column = columns[direction > 0 ? 0 : columns.length - 1];
+                const wrapped = column?.windows[column.focusIndex];
+                if (wrapped)
+                    this._focusStripWindow(located.state, wrapped);
+            }
 
             return;
         }
@@ -1341,6 +1587,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (neighbor) {
             state.activeWindow = neighbor;
             neighbor.activate(global.get_current_time());
+        } else {
+            this._focusAcrossMonitor(workspace, monitor, axis, direction);
         }
     }
 
@@ -1415,7 +1663,9 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         const strip = state.strip;
 
         if (axis === 'x') {
-            const target = at.column + direction;
+            let target = at.column + direction;
+            if (this._settings.get_boolean('wrap-column-movement'))
+                target = (target + strip.columns.length) % strip.columns.length;
             if (target < 0 || target >= strip.columns.length)
                 return;
 
@@ -1644,7 +1894,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     }
 
     _newStrip() {
-        return {columns: [], focusColumn: -1};
+        return {columns: [], focusColumn: -1, viewportOffset: null};
     }
 
     _newColumn(windows, widthFraction) {
@@ -1725,6 +1975,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         // Drop windows that left (closed, minimized, floated, re-slotted),
         // collapsing empty columns and keeping weights aligned to survivors.
         for (const column of strip.columns) {
+            const rememberedFocus = column.windows[column.focusIndex];
             const kept = [];
             const weights = [];
             column.windows.forEach((window, index) => {
@@ -1736,7 +1987,9 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             });
             column.windows = kept;
             column.heightWeights = weights;
-            column.focusIndex = Math.max(0, Math.min(column.focusIndex, kept.length - 1));
+            column.focusIndex = kept.includes(rememberedFocus)
+                ? kept.indexOf(rememberedFocus)
+                : Math.max(0, Math.min(column.focusIndex, kept.length - 1));
         }
         strip.columns = strip.columns.filter(column => column.windows.length > 0);
 
@@ -1778,17 +2031,27 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (strip.columns.length === 0)
             strip.focusColumn = -1;
 
+        // Admission can happen after Mutter already focused the newcomer,
+        // or on workspace activation. Model focus must match actual focus.
+        const actualFocus = this._findInStrip(strip, global.display.focus_window);
+        if (actualFocus) {
+            strip.focusColumn = actualFocus.column;
+            strip.columns[actualFocus.column].focusIndex = actualFocus.index;
+        }
+
         state.activeWindow = this._stripFocusedWindow(strip);
     }
 
     _layoutStrip(state, workArea, gap, monitor, forceAll = false) {
         const strip = state.strip;
-        if (!strip || strip.columns.length === 0)
+        if (this._grabbedWindow || !strip || strip.columns.length === 0)
             return this._newPlacementStats();
 
         const inner = this._insetRect(workArea, gap);
+        const expandSingle = strip.columns.length === 1 &&
+            this._settings.get_boolean('single-column-full-width');
         const widths = strip.columns.map(column =>
-            Math.max(MIN_TILE_SIZE, Math.floor(inner.width * column.widthFraction)));
+            Math.max(MIN_TILE_SIZE, Math.floor(inner.width * (expandSingle ? 1 : column.widthFraction))));
 
         const offsets = [];
         let cursor = 0;
@@ -1797,11 +2060,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             cursor += width + gap;
         }
 
-        // Always-center policy: the focused column's center sits at the
-        // work-area center; everything else falls where the strip puts it.
         strip.focusColumn = Math.max(0, Math.min(strip.focusColumn, strip.columns.length - 1));
-        const focusedCenter = offsets[strip.focusColumn] + widths[strip.focusColumn] / 2;
-        const origin = Math.round(inner.x + inner.width / 2 - focusedCenter);
+        const origin = this._stripOrigin(strip, inner, offsets, widths, gap);
 
         const placements = [];
         strip.columns.forEach((column, index) => {
@@ -1822,19 +2082,6 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 placements.push({...placement, parked});
         });
 
-        // Captured before any frame moves: where each already-placed window
-        // visually sits right now (actor position plus any in-flight scroll
-        // translation), so a pass that lands mid-animation continues smoothly
-        // from the current on-screen position. Fresh windows just appear.
-        const fromVisual = new Map();
-        if (this._animationsEnabled()) {
-            for (const {window} of placements) {
-                const actor = window.get_compositor_private?.();
-                if (actor && this._appliedRects.has(window))
-                    fromVisual.set(window, actor.x + actor.translation_x);
-            }
-        }
-
         const stats = this._applyPlacements(placements, workArea, true, forceAll);
 
         for (const {window, parked} of placements) {
@@ -1843,93 +2090,150 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             } else {
                 this._unparkStripWindow(window);
                 this._clipStripWindow(window, monitor);
-
-                const applied = this._appliedRects.get(window);
-                const from = fromVisual.get(window);
-                if (stats.committedWindows.has(window) && applied && from !== undefined)
-                    this._animateStripWindow(window, from, applied.x);
             }
         }
 
         return stats;
     }
 
-    _animationsEnabled() {
-        return St.Settings.get().enable_animations && !Main.overview.visible;
+    _stripOrigin(strip, inner, offsets, widths, gap) {
+        const left = offsets[strip.focusColumn];
+        const width = widths[strip.focusColumn];
+        let offset = strip.viewportOffset ?? 0;
+        if (this._settings.get_string('scrolling-focus-mode') === 'center') {
+            offset = left + width / 2 - inner.width / 2;
+        } else {
+            // Fit moves only as far as needed to reveal the focused column.
+            // Clamp excess space at the tape ends after closing or resizing.
+            if (left < offset)
+                offset = left;
+            else if (left + width > offset + inner.width)
+                offset = left + width - inner.width;
+            const total = widths.reduce((sum, value) => sum + value, 0) + gap * (widths.length - 1);
+            offset = Math.max(0, Math.min(offset, Math.max(0, total - inner.width)));
+        }
+        strip.viewportOffset = Math.round(offset);
+        return inner.x - strip.viewportOffset;
     }
 
-    // Scroll animation: frames jump to their final rects during placement
+    _animationsEnabled() {
+        return this._settings.get_int('animation-duration') > 0 &&
+            St.Settings.get().enable_animations && !Main.overview.visible;
+    }
+
+    // Layout animation: frames jump to their final rects during placement
     // (input follows reality); the actor then eases a compositor-side
-    // translation_x from its old visual position back to zero, so Mutter's
+    // translation from its old visual position back to zero, so Mutter's
     // placement constraints never see an intermediate position.
-    _animateStripWindow(window, fromVisualX, targetX) {
+    _animateWindow(window, from, target) {
         const actor = window.get_compositor_private?.();
         if (!actor || typeof actor.connect !== 'function')
             return;
 
         this._stopStripAnimation(window);
+        const duration = this._settings.get_int('animation-duration');
+        const entry = {
+            actor, timeline: null, frameId: 0, completedId: 0,
+            notifyId: 0, yNotifyId: 0, destroyId: 0, timeoutId: 0,
+            visual: {x: from.x, y: from.y},
+            origin: {x: from.x, y: from.y},
+            destination: {x: actor.x, y: actor.y},
+            segmentStart: 0,
+        };
+        this._stripAnimations.set(window, entry);
 
-        const settle = () => {
-            const delta = fromVisualX - actor.x;
-
-            if (Math.abs(delta) < 1) {
-                actor.translation_x = 0;
-                this._stripAnimations.delete(window);
+        // Keep a stage-space position independent of the actor's allocation.
+        // A client resize can change x and y separately, or Mutter can clamp
+        // the requested frame to an app's minimum size. Neither may cause a
+        // visible jump while the animation waits for, or follows, that move.
+        const pin = () => {
+            actor.translation_x = entry.visual.x - actor.x;
+            actor.translation_y = entry.visual.y - actor.y;
+        };
+        const start = () => {
+            if (entry.timeoutId) {
+                GLib.source_remove(entry.timeoutId);
+                entry.timeoutId = 0;
+            }
+            entry.destination = {x: actor.x, y: actor.y};
+            if (duration === 0 ||
+                (Math.abs(entry.visual.x - actor.x) < 1 && Math.abs(entry.visual.y - actor.y) < 1)) {
+                this._stopStripAnimation(window, true);
                 return;
             }
 
-            actor.translation_x = delta;
-            this._stripAnimations.set(window, {actor, notifyId: 0, destroyId: 0, timeoutId: 0});
-            actor.ease({
-                translation_x: 0,
-                duration: SCROLL_ANIMATION_MS,
-                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-                onStopped: () => this._stripAnimations.delete(window),
+            entry.timeline = Clutter.Timeline.new_for_actor(actor, duration);
+            entry.frameId = entry.timeline.connect('new-frame', (_timeline, elapsed) => {
+                const remaining = Math.max(1, duration - entry.segmentStart);
+                const progress = Math.min(1, Math.max(0, (elapsed - entry.segmentStart) / remaining));
+                const eased = 1 - (1 - progress) ** 3;
+                entry.visual.x = entry.origin.x + (entry.destination.x - entry.origin.x) * eased;
+                entry.visual.y = entry.origin.y + (entry.destination.y - entry.origin.y) * eased;
+                pin();
             });
+            entry.completedId = entry.timeline.connect('completed', () => {
+                this._stopStripAnimation(window, true);
+            });
+            entry.timeline.start();
         };
-
-        if (actor.x === targetX) {
-            settle();
-            return;
-        }
-
-        // The compositor moves the actor to its new frame position
-        // asynchronously; pin the current visual position until it lands (or
-        // a fallback fires, e.g. when the move was absorbed) and ease then.
-        actor.translation_x = fromVisualX - actor.x;
-
-        const entry = {actor, notifyId: 0, destroyId: 0, timeoutId: 0};
-        const fire = () => {
-            this._stripAnimations.delete(window);
-            this._clearStripAnimationEntry(entry);
-            settle();
+        const onPosition = () => {
+            pin();
+            if (entry.timeline) {
+                // Rebase a late allocation using the remaining animation time,
+                // preserving position instead of replaying the original move.
+                entry.origin = {...entry.visual};
+                entry.destination = {x: actor.x, y: actor.y};
+                entry.segmentStart = entry.timeline.get_elapsed_time();
+            } else {
+                // The frame clock advances after allocation. If y follows x
+                // in this allocation, the running branch rebases at time zero.
+                start();
+            }
         };
-
-        entry.notifyId = actor.connect('notify::x', fire);
+        entry.notifyId = actor.connect('notify::x', onPosition);
+        entry.yNotifyId = actor.connect('notify::y', onPosition);
         entry.destroyId = actor.connect('destroy', () => {
             entry.destroyId = 0;
             this._stripAnimations.delete(window);
             this._clearStripAnimationEntry(entry);
         });
-        entry.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
-            entry.timeoutId = 0;
-            fire();
-            return GLib.SOURCE_REMOVE;
-        });
-        this._stripAnimations.set(window, entry);
+        pin();
+
+        const alreadyMoved = Number.isFinite(from.actorX) &&
+            (actor.x !== from.actorX || actor.y !== from.actorY);
+        if (alreadyMoved || (actor.x === target.x && actor.y === target.y)) {
+            start();
+        } else {
+            // A refused/no-op move may never produce a position notification.
+            // This is only a cleanup bound; actual moves start on allocation,
+            // regardless of whether they match the requested coordinates.
+            entry.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                entry.timeoutId = 0;
+                start();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
     }
 
     _clearStripAnimationEntry(entry) {
+        if (entry.timeline) {
+            entry.timeline.disconnect(entry.frameId);
+            entry.timeline.disconnect(entry.completedId);
+            entry.timeline.stop();
+            entry.timeline = null;
+        }
         try {
             if (entry.notifyId)
                 entry.actor.disconnect(entry.notifyId);
+            if (entry.yNotifyId)
+                entry.actor.disconnect(entry.yNotifyId);
             if (entry.destroyId)
                 entry.actor.disconnect(entry.destroyId);
         } catch (_error) {
             // The actor may already be disposed.
         }
-
         entry.notifyId = 0;
+        entry.yNotifyId = 0;
         entry.destroyId = 0;
 
         if (entry.timeoutId) {
@@ -1953,8 +2257,11 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
         try {
             actor.remove_transition('translation-x');
-            if (resetTranslation)
+            actor.remove_transition('translation-y');
+            if (resetTranslation) {
                 actor.translation_x = 0;
+                actor.translation_y = 0;
+            }
         } catch (_error) {
             // Disposed actor; nothing to stop.
         }
@@ -2088,6 +2395,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 // clip must re-anchor during animation too. Property changes
                 // are batched into one clip update per compositor frame.
                 translationId: actor.connect('notify::translation-x', () => this._queueStripClipRefresh(window)),
+                translationYId: actor.connect('notify::translation-y', () => this._queueStripClipRefresh(window)),
                 destroyId: actor.connect('destroy', () => {
                     this._stripClips.delete(window);
                     this._dirtyStripClips.delete(window);
@@ -2143,7 +2451,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         // backed out for the crop to stay glued to the monitor edge.
         entry.actor.set_clip(
             monitorRect.x - entry.actor.x - entry.actor.translation_x,
-            monitorRect.y - entry.actor.y,
+            monitorRect.y - entry.actor.y - entry.actor.translation_y,
             monitorRect.width,
             monitorRect.height
         );
@@ -2161,6 +2469,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             entry.actor.disconnect(entry.xId);
             entry.actor.disconnect(entry.yId);
             entry.actor.disconnect(entry.translationId);
+            entry.actor.disconnect(entry.translationYId);
             entry.actor.disconnect(entry.destroyId);
             entry.actor.remove_clip();
         } catch (_error) {

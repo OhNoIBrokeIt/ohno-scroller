@@ -59,6 +59,22 @@ export default class OhNoScrollerPrefs extends ExtensionPreferences {
         ], 'What new workspaces start as; toggle any workspace at runtime with the shortcut.');
         addSpin(layoutGroup, settings, 'column-width-percent', 'New column width', 25, 100, 5,
             'Percent of the work area a new scrolling column occupies.');
+        addSpin(layoutGroup, settings, 'resize-step', 'Keyboard resize step', 5, 200, 5,
+            'Pixels per press; hold the shortcut to keep resizing.');
+        addSpin(layoutGroup, settings, 'animation-duration', 'Movement animation duration', 0, 1000, 10,
+            'Milliseconds; zero disables movement animations. Also follows the system animation setting.');
+
+        const scrollingGroup = new Adw.PreferencesGroup({title: 'Scrolling columns'});
+        page.add(scrollingGroup);
+        addCombo(scrollingGroup, settings, 'scrolling-focus-mode', 'Follow focus', [
+            ['fit', 'Fit column into view'],
+            ['center', 'Center focused column'],
+        ], 'Fit keeps visible columns still when focus changes.');
+        addSwitch(scrollingGroup, settings, 'single-column-full-width', 'Expand a lone column',
+            'Restore its chosen width when another column opens.');
+        addSwitch(scrollingGroup, settings, 'wrap-focus', 'Wrap horizontal focus',
+            'Focus an adjacent monitor first; otherwise continue at the opposite end.');
+        addSwitch(scrollingGroup, settings, 'wrap-column-movement', 'Wrap column movement');
 
         const shortcutsGroup = new Adw.PreferencesGroup({
             title: 'Shortcuts',
@@ -69,6 +85,12 @@ export default class OhNoScrollerPrefs extends ExtensionPreferences {
         for (const [title, key] of [
             ['Toggle tiling', 'toggle-tiling'],
             ['Toggle layout mode', 'toggle-layout-mode'],
+            ['Toggle floating', 'toggle-floating'],
+            ['Toggle split direction', 'toggle-split'],
+            ['Decrease width', 'resize-width-decrease'],
+            ['Increase width', 'resize-width-increase'],
+            ['Decrease height', 'resize-height-decrease'],
+            ['Increase height', 'resize-height-increase'],
             ['Retile workspace', 'retile-workspace'],
             ['Equalize split ratios / stack heights', 'equalize-ratios'],
             ['Cycle column width preset', 'cycle-column-width'],
