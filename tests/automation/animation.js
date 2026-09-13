@@ -107,6 +107,46 @@ async function checkLateAllocation(extension, failures) {
     }
 }
 
+async function checkManualAnimationPause(extension, failures) {
+    const actor = new Clutter.Actor({x: 100, y: 100, width: 60, height: 40});
+    Main.uiGroup.add_child(actor);
+    const window = {get_compositor_private: () => actor};
+    try {
+        extension._animateWindow(window, {x: 0, y: 0}, {x: 400, y: 100});
+        actor.x = 400;
+        if (!extension._stripAnimations.has(window))
+            failures.push('Manual pause fixture did not start an owned animation');
+        extension._updateManualAnimationPause(true);
+        if (extension._stripAnimations.has(window) || actor.translation_x !== 0 || actor.translation_y !== 0)
+            failures.push('Manual pause did not immediately settle owned movement');
+        const animationCount = extension._stripAnimations.size;
+        extension._updateManualAnimationPause(false);
+        await Scripting.sleep(50);
+        if (extension._stripAnimations.size !== animationCount)
+            failures.push('Manual pause resume replayed decorative movement');
+    } finally {
+        extension._updateManualAnimationPause(false);
+        extension._stopStripAnimation(window, true);
+        actor.destroy();
+    }
+}
+
+function checkForeignTransitionOwnership(extension, failures) {
+    const actor = new Clutter.Actor({x: 0, y: 0, width: 20, height: 20});
+    Main.uiGroup.add_child(actor);
+    const window = {get_compositor_private: () => actor};
+    try {
+        actor.ease({translation_x: 100, duration: 500, mode: Clutter.AnimationMode.EASE_OUT_QUAD});
+        const transition = actor.get_transition('translation-x');
+        extension._stopStripAnimation(window, true);
+        if (!transition || actor.get_transition('translation-x') !== transition)
+            failures.push('Stopping an unowned animation removed a Shell-owned transition');
+    } finally {
+        actor.remove_all_transitions();
+        actor.destroy();
+    }
+}
+
 export async function run() {
     const extension = Main.extensionManager.lookup('ohno-scroller@ohnoibrokeit.dev').stateObj;
     const workspace = global.workspace_manager.get_active_workspace();
@@ -163,6 +203,8 @@ export async function run() {
     const scrollDistance = Math.abs(traces.scroll.at(-1).x - traces.scroll[0].x);
     checkContinuousSteps(traces.reverse, scrollDistance, 'Rapid scrolling reversal', failures);
     await checkLateAllocation(extension, failures);
+    await checkManualAnimationPause(extension, failures);
+    checkForeignTransitionOwnership(extension, failures);
     if (failures.length)
         throw new Error(`Animation continuity failures:\n${failures.join('\n')}`);
     console.log('Oh No Scroller: rendered-frame animation continuity checks passed');

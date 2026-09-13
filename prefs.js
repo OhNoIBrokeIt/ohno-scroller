@@ -3,6 +3,7 @@ import Gio from 'gi://Gio';
 import Gtk from 'gi://Gtk';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
+import {optionalBarSettings} from './optionalBarSettings.js';
 
 function addSwitch(group, settings, key, title, subtitle = null) {
     const row = new Adw.SwitchRow({title, subtitle});
@@ -50,6 +51,35 @@ export default class OhNoScrollerPrefs extends ExtensionPreferences {
             title: 'Layout',
         });
         page.add(layoutGroup);
+
+        const barSettings = optionalBarSettings();
+        const pauseGroup = new Adw.PreferencesGroup({
+            title: 'Movement animations paused',
+            description: 'Ohno Bar Performance Mode is active. Window tiling remains active.',
+            visible: barSettings?.get_boolean('performance-mode') ?? false,
+        });
+        const resumeRow = new Adw.ActionRow({
+            title: 'Resume movement animations',
+            subtitle: 'Turn off the existing Ohno Bar Performance Mode switch.',
+        });
+        const resumeButton = new Gtk.Button({label: 'Turn off', valign: Gtk.Align.CENTER});
+        resumeButton.connect('clicked', () => barSettings?.set_boolean('performance-mode', false));
+        resumeRow.add_suffix(resumeButton);
+        pauseGroup.add(resumeRow);
+        page.add(pauseGroup);
+        let barSignalId = 0;
+        if (barSettings) {
+            barSignalId = barSettings.connect('changed::performance-mode', () => {
+                pauseGroup.visible = barSettings.get_boolean('performance-mode');
+            });
+            window.connect('close-request', () => {
+                if (barSignalId) {
+                    barSettings.disconnect(barSignalId);
+                    barSignalId = 0;
+                }
+                return false;
+            });
+        }
 
         addSwitch(layoutGroup, settings, 'tiling-enabled', 'Manage windows');
         addSpin(layoutGroup, settings, 'gap-size', 'Gap size', 0, 64, 1, 'Pixels between windows and columns.');
@@ -107,9 +137,11 @@ export default class OhNoScrollerPrefs extends ExtensionPreferences {
             ['Move window to new column', 'move-window-new-column'],
         ]) {
             const row = new Adw.ActionRow({
+                use_markup: false,
                 title,
-                subtitle: settings.get_strv(key).join(', '),
             });
+            // Apply after construction so accelerators cannot be parsed as markup.
+            row.subtitle = settings.get_strv(key).join(', ');
             shortcutsGroup.add(row);
         }
 

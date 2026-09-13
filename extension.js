@@ -6,6 +6,7 @@ import St from 'gi://St';
 
 import {Extension as ExtensionBase} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {optionalBarSettings} from './optionalBarSettings.js';
 
 const KEYBINDINGS = [
     'toggle-tiling',
@@ -67,6 +68,7 @@ const COLUMN_WIDTH_PRESETS = [1 / 3, 0.5, 2 / 3, 1.0];
 // settle. Wait for the final geometry instead of rebuilding the same layout
 // once per intermediate notification.
 const WORKAREA_SETTLE_MS = 100;
+const MONITOR_TRANSFER_INTENT_MS = 1000;
 // Mutter refuses to place a frame with less than this many pixels visible
 // (measured empirically on Mutter 50: user-op placement clamps to exactly
 // 75px on-screen; non-user-op placement forces the window fully on-screen).
@@ -116,6 +118,12 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._retilePassCount = 0;
         this._placementCommitCount = 0;
         this._placementSkipCount = 0;
+        this._enableToken = {};
+        this._pendingMonitorTransfers = new Map();
+        this._fullscreenRestoreOwners = new Map();
+        const barExtension = Main.extensionManager.lookup('ohno-bar@ohnoibrokeit.dev');
+        this._barSettings = optionalBarSettings({extensionPath: barExtension?.path ?? null});
+        this._manualAnimationPause = this._barSettings?.get_boolean('performance-mode') ?? false;
 
         this._addKeybindings();
         this._connectSignals();
@@ -139,6 +147,9 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         for (const sourceId of this._closingWindowSourceIds.values())
             GLib.source_remove(sourceId);
 
+        this._clearMonitorTransferIntents();
+        this._clearFullscreenRestores();
+
         this._releaseTilingPresentation();
 
         this._signals = [];
@@ -158,9 +169,12 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._floatingWindows.clear();
         this._floatingRects.clear();
         this._pendingRetileReasons.clear();
+        this._fullscreenRestoreOwners.clear();
         this._grabbedWindow = null;
         this._inLayout = false;
         this._settings = null;
+        this._barSettings = null;
+        this._enableToken = null;
     }
 
     _connect(object, signal, callback) {
@@ -168,6 +182,13 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     }
 
     _connectSignals() {
+        this._connect(global.window_manager, 'size-change', (_manager, actor, change) => {
+            if (change === Meta.SizeChange.MONITOR_MOVE)
+                this._recordMonitorTransferIntent(actor?.meta_window);
+        });
+        this._connect(global.display, 'window-entered-monitor', (_display, monitor, window) => {
+            this._completeMonitorTransfer(window, monitor);
+        });
         this._connect(global.display, 'window-created', (_display, window) => {
             this._trackWindow(window);
             if (this._tilingEnabled())
@@ -185,6 +206,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             this._queueRetile('workareas-changed', WORKAREA_SETTLE_MS);
         });
         this._connect(global.workspace_manager, 'active-workspace-changed', () => {
+            this._clearMonitorTransferIntents();
             this._queueRetile('active-workspace-changed');
         });
         this._connect(global.workspace_manager, 'workspace-removed', () => {
@@ -194,6 +216,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         // rearranged, so per-index layout state cannot be trusted across a
         // change; rebuild the trees from the windows present afterwards.
         this._connect(Main.layoutManager, 'monitors-changed', () => {
+            this._clearMonitorTransferIntents();
+            this._clearFullscreenRestores();
             this._releaseTilingPresentation();
             this._states.clear();
             this._lastWorkAreaSignature = this._workAreaSignature();
@@ -244,12 +268,20 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                     this._stopStripAnimation(window, true);
             }
         });
+        if (this._barSettings) {
+            this._connect(this._barSettings, 'changed::performance-mode', () => {
+                this._updateManualAnimationPause(
+                    this._barSettings.get_boolean('performance-mode'));
+            });
+        }
         this._connect(this._settings, 'changed', (_settings, key) => {
             if (key === 'tiling-enabled') {
                 if (this._tilingEnabled())
                     this._queueRetile('tiling-enabled');
-                else
+                else {
+                    this._clearFullscreenRestores();
                     this._releaseTilingPresentation();
+                }
             } else if (['gap-size', 'scrolling-focus-mode', 'single-column-full-width'].includes(key)) {
                 this._queueRetile(key);
             } else if (key === 'animation-duration' && !this._animationsEnabled()) {
@@ -832,6 +864,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
             this._appliedRects.delete(window);
             this._correctionHistory.delete(window);
             this._forcePlacementWindows.delete(window);
+            this._clearMonitorTransferIntent(window);
+            this._clearFullscreenRestore(window);
             if (this._tilingEnabled())
                 this._queueRetile('window-workspace-changed');
         };
@@ -846,13 +880,48 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 this._unclipStripWindow(window);
                 this._unparkStripWindow(window);
                 this._forcePlacementWindows.add(window);
-                queueUnlessLayout();
+                if (window.is_fullscreen()) {
+                    this._clearFullscreenRestore(window);
+                } else {
+                    const workspace = window.get_workspace();
+                    const located = workspace
+                        ? this._locateInStrips(workspace, window)
+                        : null;
+                    if (located) {
+                        this._clearFullscreenRestore(window);
+                        const monitor = located.monitor;
+                        const token = this._enableToken;
+                        // Mutter may restore the pre-fullscreen frame after
+                        // its compositor animation. Reconcile once after the
+                        // same bounded ownership window used for monitor moves.
+                        const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
+                            MONITOR_TRANSFER_INTENT_MS, () => {
+                            this._fullscreenRestoreOwners.delete(window);
+                            const current = this._settings && token === this._enableToken &&
+                                this._tilingEnabled() && window.get_workspace() === workspace
+                                ? this._locateInStrips(workspace, window)
+                                : null;
+                            if (current?.monitor === monitor && window.get_monitor() !== monitor) {
+                                window.move_to_monitor(monitor);
+                                this._forcePlacementWindows.add(window);
+                                this._queueRetile('fullscreen-restore');
+                            }
+                            return GLib.SOURCE_REMOVE;
+                        });
+                        this._fullscreenRestoreOwners.set(window, {
+                            monitor, timeoutId, token, workspace,
+                        });
+                    }
+                }
+                if (!this._inLayout && this._tilingEnabled())
+                    this._queueRetile('fullscreen-changed', 250);
             }),
             window.connect('notify::maximized-horizontally', () => this._onWindowMaximizedChanged(window)),
             window.connect('notify::maximized-vertically', () => this._onWindowMaximizedChanged(window)),
             window.connect('size-changed', () => this._onWindowGeometryChanged(window)),
             window.connect('position-changed', () => this._onWindowGeometryChanged(window)),
             window.connect('unmanaged', () => {
+                this._clearMonitorTransferIntent(window);
                 this._clearPendingWindowRetile(window);
                 this._disconnectWindowSignals(window);
                 this._stopStripAnimation(window);
@@ -862,6 +931,7 @@ export default class OhNoScrollerExtension extends ExtensionBase {
                 this._forcePlacementWindows.delete(window);
                 this._floatingWindows.delete(window);
                 this._floatingRects.delete(window);
+                this._clearFullscreenRestore(window);
                 const wasPlaced = this._appliedRects.delete(window);
                 const wasInLayout = this._removeWindowFromStates(window);
 
@@ -1023,6 +1093,112 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._queueRetile('maximized-changed');
     }
 
+    _recordMonitorTransferIntent(window) {
+        if (!window || !this._settings || !this._tilingEnabled())
+            return;
+
+        const workspace = window.get_workspace();
+        if (!workspace || this._workspaceMode(workspace) !== 'scrolling')
+            return;
+
+        const located = this._locateInStrips(workspace, window);
+        if (!located)
+            return;
+
+        this._clearFullscreenRestore(window);
+        this._clearMonitorTransferIntent(window);
+        const token = this._enableToken;
+        const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
+            MONITOR_TRANSFER_INTENT_MS, () => {
+                const intent = this._pendingMonitorTransfers.get(window);
+                if (intent?.token === token) {
+                    this._pendingMonitorTransfers.delete(window);
+                    if (this._settings)
+                        this._queueRetile('monitor-transfer-expired');
+                }
+                return GLib.SOURCE_REMOVE;
+            });
+        this._pendingMonitorTransfers.set(window, {
+            token,
+            workspace,
+            sourceMonitor: located.monitor,
+            sourceState: located.state,
+            sourceAt: located.at,
+            timeoutId,
+        });
+    }
+
+    _completeMonitorTransfer(window, destinationMonitor) {
+        const intent = this._pendingMonitorTransfers.get(window);
+        if (!intent)
+            return;
+        this._clearMonitorTransferIntent(window);
+
+        if (!this._settings || intent.token !== this._enableToken ||
+            window.get_workspace() !== intent.workspace ||
+            destinationMonitor === intent.sourceMonitor)
+            return;
+
+        const current = this._locateInStrips(intent.workspace, window);
+        if (!current || current.state !== intent.sourceState)
+            return;
+
+        const sourceStrip = current.state.strip;
+        const sourceColumn = sourceStrip.columns[current.at.column];
+        const widthFraction = sourceColumn.widthFraction;
+        const savedWidthFraction = sourceColumn.savedWidthFraction;
+        const heightWeight = sourceColumn.heightWeights[current.at.index] ?? 1;
+        this._removeFromStrip(current.state, window);
+
+        const destinationState = this._stateFor(intent.workspace, destinationMonitor);
+        if (!destinationState.strip)
+            destinationState.strip = this._newStrip();
+        const destinationStrip = destinationState.strip;
+        const column = this._newColumn([window], widthFraction);
+        column.savedWidthFraction = savedWidthFraction;
+        column.heightWeights[0] = heightWeight;
+        const columnIndex = Math.min(intent.sourceAt.column, destinationStrip.columns.length);
+        destinationStrip.columns.splice(columnIndex, 0, column);
+        destinationStrip.focusColumn = columnIndex;
+        destinationState.activeWindow = window;
+
+        this._stopStripAnimation(window, true);
+        this._unclipStripWindow(window);
+        this._unparkStripWindow(window);
+        this._appliedRects.delete(window);
+        this._correctionHistory.delete(window);
+        this._forcePlacementWindows.add(window);
+        this._queueRetile('monitor-transfer');
+    }
+
+    _clearMonitorTransferIntent(window) {
+        const intent = this._pendingMonitorTransfers?.get(window);
+        if (!intent)
+            return;
+        this._pendingMonitorTransfers.delete(window);
+        if (intent.timeoutId)
+            GLib.source_remove(intent.timeoutId);
+    }
+
+    _clearMonitorTransferIntents() {
+        for (const window of [...(this._pendingMonitorTransfers?.keys() ?? [])])
+            this._clearMonitorTransferIntent(window);
+    }
+
+    _clearFullscreenRestore(window) {
+        const restore = this._fullscreenRestoreOwners?.get(window);
+        if (!restore)
+            return;
+        this._fullscreenRestoreOwners.delete(window);
+        if (restore.timeoutId)
+            GLib.source_remove(restore.timeoutId);
+    }
+
+    _clearFullscreenRestores() {
+        for (const window of [...(this._fullscreenRestoreOwners?.keys() ?? [])])
+            this._clearFullscreenRestore(window);
+    }
+
     // App-driven geometry changes (session restore, late self-resize) used to
     // stick, leaving the window on top of its neighbors. Snap the layout back
     // when a placed window drifts off its applied rect, with a per-target cap
@@ -1031,8 +1207,17 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         if (this._inLayout || !this._settings || !this._tilingEnabled())
             return;
 
-        if (this._grabbedWindow === window || this._stripAnimations.has(window))
+        if (this._grabbedWindow === window || this._stripAnimations.has(window) ||
+            this._pendingMonitorTransfers.has(window))
             return;
+
+        const restore = this._fullscreenRestoreOwners.get(window);
+        if (restore) {
+            if (window.get_monitor() !== restore.monitor) {
+                this._forcePlacementWindows.add(window);
+                return;
+            }
+        }
 
         const applied = this._appliedRects.get(window);
         if (!applied || !this._isTileable(window))
@@ -1318,6 +1503,11 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         this._inLayout = true;
         try {
             for (const {window, rect} of placements) {
+                // Mutter owns geometry between MONITOR_MOVE and the matching
+                // entered-monitor event. Reasserting the old strip here can
+                // prevent that native move from ever crossing monitors.
+                if (this._pendingMonitorTransfers.has(window))
+                    continue;
                 if (!this._canPlace(window)) {
                     this._log('placement skipped: window is not currently placeable');
                     continue;
@@ -2085,6 +2275,8 @@ export default class OhNoScrollerExtension extends ExtensionBase {
         const stats = this._applyPlacements(placements, workArea, true, forceAll);
 
         for (const {window, parked} of placements) {
+            if (this._pendingMonitorTransfers.has(window))
+                continue;
             if (parked) {
                 this._parkStripWindow(window);
             } else {
@@ -2118,7 +2310,16 @@ export default class OhNoScrollerExtension extends ExtensionBase {
 
     _animationsEnabled() {
         return this._settings.get_int('animation-duration') > 0 &&
-            St.Settings.get().enable_animations && !Main.overview.visible;
+            St.Settings.get().enable_animations && !Main.overview.visible &&
+            !this._manualAnimationPause;
+    }
+
+    _updateManualAnimationPause(paused) {
+        this._manualAnimationPause = paused;
+        if (!paused)
+            return;
+        for (const window of [...this._stripAnimations.keys()])
+            this._stopStripAnimation(window, true);
     }
 
     // Layout animation: frames jump to their final rects during placement
@@ -2246,21 +2447,15 @@ export default class OhNoScrollerExtension extends ExtensionBase {
     // the actor also snaps to its real position (park, disable).
     _stopStripAnimation(window, resetTranslation = false) {
         const entry = this._stripAnimations.get(window);
-        if (entry) {
-            this._stripAnimations.delete(window);
-            this._clearStripAnimationEntry(entry);
-        }
-
-        const actor = window.get_compositor_private?.();
-        if (!actor)
+        if (!entry)
             return;
+        this._stripAnimations.delete(window);
+        this._clearStripAnimationEntry(entry);
 
         try {
-            actor.remove_transition('translation-x');
-            actor.remove_transition('translation-y');
             if (resetTranslation) {
-                actor.translation_x = 0;
-                actor.translation_y = 0;
+                entry.actor.translation_x = 0;
+                entry.actor.translation_y = 0;
             }
         } catch (_error) {
             // Disposed actor; nothing to stop.

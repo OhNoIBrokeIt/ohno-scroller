@@ -1,5 +1,10 @@
 # Oh No Scroller
 
+Version 10 adds shared Performance Mode feedback and native monitor-transfer
+recovery, including fullscreen moves and cleanup of cancelled transfers. The
+GNOME Shell 50 suite covers actual two-monitor moves, animation continuity,
+standalone preferences, and operation with Oh No Bar absent.
+
 GNOME Shell 50 tiler with Hyprland-inspired controls for a terminal-heavy workflow. Each
 workspace runs in one of two layout modes, toggled at runtime:
 
